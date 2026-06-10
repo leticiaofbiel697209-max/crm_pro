@@ -8,6 +8,9 @@ st.title("📊 CRM Inteligente - Nível CEO")
 if "clientes_ligados" not in st.session_state:
     st.session_state.clientes_ligados = set()
 
+if "observacoes_orc" not in st.session_state:
+    st.session_state.observacoes_orc = {}
+
 def fmt(v):
     try:
         return f"R${float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -214,7 +217,8 @@ if st.sidebar.button("Analisar Dados"):
 
         resumo = clientes[
             (clientes["intervalo"] > 0) &
-            (clientes["dias_sem_comprar"] >= clientes["intervalo"] * 0.8)
+            (clientes["dias_sem_comprar"] >= clientes["intervalo"] * 0.8) &
+            (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
         ].sort_values("dias_sem_comprar", ascending=False)
 
         aba_ceo, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base = st.tabs([
@@ -229,10 +233,10 @@ if st.sidebar.button("Analisar Dados"):
             inadimplencia_total = clientes["inadimplencia"].sum()
 
             st.markdown(f"**Receita prevista:** **{fmt(receita_prevista)}**")
-            st.caption("Cálculo: soma do faturamento histórico de todos os clientes analisados no relatório de vendas.")
+            st.caption("Período: corresponde ao faturamento total contido no relatório de vendas importado. Se o relatório for mensal, é receita do mês; se for anual, é receita do ano.")
 
             st.markdown(f"**Venda possível hoje:** **{fmt(capacidade_hoje)}**")
-            st.caption("Cálculo: soma do ticket médio dos clientes que estão na aba Prioridade, ou seja, dentro da janela ideal de recompra e ainda não marcados como 'Já liguei'.")
+            st.caption("Cálculo: soma do ticket médio dos clientes na aba Prioridade, dentro da janela ideal de recompra e ainda não marcados como 'Já liguei'.")
 
             st.markdown(f"**Inadimplência real:** **{fmt(inadimplencia_total)}**")
             st.caption("Cálculo: soma das contas com status Atrasado/Vencido.")
@@ -266,7 +270,7 @@ Score de risco: **{int(row['score_risco'])}/100**
                     else:
                         st.write("Nenhum orçamento em aberto.")
 
-                if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_{row['Cliente']}"):
+                if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_prioridade_{row['Cliente']}"):
                     st.session_state.clientes_ligados.add(row["Cliente"])
                     st.rerun()
 
@@ -291,9 +295,12 @@ Inadimplência: **{fmt(row['inadimplencia'])}**
 Score de risco: **{int(row['score_risco'])}/100**
 
 🤖 **IA:** {row['acao_ia']}
-
----
 """)
+                if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_resumo_{row['Cliente']}"):
+                    st.session_state.clientes_ligados.add(row["Cliente"])
+                    st.rerun()
+
+                st.markdown("---")
 
         with aba_orc:
             st.subheader("📄 Orçamentos em aberto para retorno")
@@ -307,6 +314,8 @@ Score de risco: **{int(row['score_risco'])}/100**
                     for j, (_, r) in enumerate(cards[i:i+3]):
                         with cols[j]:
                             valor_txt = fmt(r[co_valor]) if co_valor else "Sem valor"
+                            chave_obs = f"obs_orc_{r[co_num]}"
+
                             st.markdown(f"""
 <div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
 <b>Orçamento Nº {r[co_num]}</b><br>
@@ -316,6 +325,13 @@ Status: <b>{r['ação_recomendada']}</b><br>
 Valor: <b>{valor_txt}</b>
 </div>
 """, unsafe_allow_html=True)
+
+                            st.text_area(
+                                "Observação",
+                                value=st.session_state.observacoes_orc.get(str(r[co_num]), ""),
+                                key=chave_obs
+                            )
+                            st.session_state.observacoes_orc[str(r[co_num])] = st.session_state[chave_obs]
 
         with aba_gestao:
             st.subheader("🧠 Gestão")
@@ -334,11 +350,26 @@ Valor: <b>{valor_txt}</b>
             if filtro_acao != "Todas":
                 base = base[base["acao_ia"] == filtro_acao]
 
-            base_exibicao = base.copy()
-            for col in ["faturamento", "ticket_medio", "inadimplencia"]:
-                base_exibicao[col] = base_exibicao[col].apply(fmt)
-
-            st.dataframe(base_exibicao)
+            cards = list(base.iterrows())
+            for i in range(0, len(cards), 3):
+                cols = st.columns(3)
+                for j, (_, r) in enumerate(cards[i:i+3]):
+                    with cols[j]:
+                        st.markdown(f"""
+<div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
+<b>{r['Cliente']}</b><br>
+Faturamento: <b>{fmt(r['faturamento'])}</b><br>
+Ticket médio: <b>{fmt(r['ticket_medio'])}</b><br>
+Compras: <b>{int(r['qtd_compras'])}</b><br>
+Intervalo médio: <b>{int(r['intervalo'])} dias</b><br>
+Última compra: <b>{r['ultima_compra'].strftime('%d/%m/%Y')}</b><br>
+Dias sem comprar: <b>{int(r['dias_sem_comprar'])}</b><br>
+Orçamentos em aberto: <b>{int(r['orcamentos_em_aberto'])}</b><br>
+Inadimplência: <b>{fmt(r['inadimplencia'])}</b><br>
+Score de risco: <b>{int(r['score_risco'])}/100</b><br>
+IA: <b>{r['acao_ia']}</b>
+</div>
+""", unsafe_allow_html=True)
 
     except Exception as e:
         st.error(f"Erro ao processar: {e}")
