@@ -40,9 +40,9 @@ def sugestao_ia(dias_sem, intervalo, orcamentos):
 
 st.sidebar.header("Importar Dados")
 
-vendas_file = st.sidebar.file_uploader("Vendas")
-orc_file = st.sidebar.file_uploader("Orçamentos")
-contas_file = st.sidebar.file_uploader("Contas a Receber")
+vendas = pd.read_excel(vendas_file, engine="openpyxl")
+contas = pd.read_excel(contas_file, engine="openpyxl")
+orc = pd.read_excel(orc_file, header=1, engine="openpyxl")
 
 if st.sidebar.button("Analisar Dados"):
 
