@@ -162,6 +162,12 @@ def processar_dados(vendas_file, orc_file, contas_file):
     clientes["dias_sem_comprar"] = (hoje - clientes["ultima_compra"]).dt.days
     clientes["ticket_medio"] = clientes["faturamento"] / clientes["qtd_compras"]
 
+    data_limite_3m = hoje - pd.DateOffset(months=3)
+    vendas_3m = vendas[vendas[cv_data] >= data_limite_3m].copy()
+
+    potencial_3m = vendas_3m.groupby(cv_cli)[cv_valor].sum() / 3
+    clientes["potencial_mensal"] = clientes["Cliente"].map(potencial_3m).fillna(0)
+
     orc_aberto = orc.copy()
     orc_aberto = orc_aberto[
         ~orc_aberto[co_status].astype(str).str.upper().str.contains("CONCRETIZADO", na=False)
@@ -230,6 +236,35 @@ def montar_resumo(clientes):
         (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
     ].sort_values("dias_sem_comprar", ascending=False)
 
+def card_cliente(row, tipo):
+    atraso = int(row["dias_sem_comprar"] - row["intervalo"])
+
+    st.markdown(f"""
+<div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
+<b>{row['Cliente']}</b><br>
+Compra a cada <b>{int(row['intervalo'])} dias</b><br>
+Está há <b>{int(row['dias_sem_comprar'])} dias</b> sem comprar<br>
+Já era para ter comprado há <b>{max(atraso, 0)} dias</b><br><br>
+Ticket médio: <b>{fmt(row['ticket_medio'])}</b><br>
+Potencial mensal: <b>{fmt(row['potencial_mensal'])}</b><br>
+Orçamentos em aberto: <b>{int(row['orcamentos_em_aberto'])}</b><br>
+Inadimplência: <b>{fmt(row['inadimplencia'])}</b><br>
+Score de risco: <b>{int(row['score_risco'])}/100 — {row['risco_inadimplencia']}</b><br><br>
+IA: <b>{row['acao_ia']}</b>
+</div>
+""", unsafe_allow_html=True)
+
+    with st.expander("Ver orçamentos em aberto"):
+        if row["numeros_orcamentos"]:
+            for num in row["numeros_orcamentos"]:
+                st.write(f"• Orçamento Nº {num}")
+        else:
+            st.write("Nenhum orçamento em aberto.")
+
+    if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_{tipo}_{row['Cliente']}"):
+        st.session_state.clientes_ligados.add(row["Cliente"])
+        st.rerun()
+
 def renderizar():
     dados = st.session_state.dados_processados
     clientes = dados["clientes"]
@@ -251,9 +286,13 @@ def renderizar():
         receita_prevista = clientes["faturamento"].sum()
         capacidade_hoje = prioridade["ticket_medio"].sum()
         inadimplencia_total = clientes["inadimplencia"].sum()
+        potencial_mensal_carteira = clientes["potencial_mensal"].sum()
 
         st.markdown(f"**Receita prevista:** **{fmt(receita_prevista)}**")
         st.caption("Período: corresponde ao faturamento total contido no relatório de vendas importado.")
+
+        st.markdown(f"**Potencial mensal da carteira:** **{fmt(potencial_mensal_carteira)}**")
+        st.caption("Cálculo: média mensal de compras dos últimos 3 meses, somada entre todos os clientes.")
 
         st.markdown(f"**Venda possível hoje:** **{fmt(capacidade_hoje)}**")
         st.caption("Cálculo: soma do ticket médio dos clientes na aba Prioridade, dentro da janela ideal de recompra e ainda não marcados como 'Já liguei'.")
@@ -267,60 +306,23 @@ def renderizar():
         if prioridade.empty:
             st.info("Nenhum cliente no timing ideal hoje.")
 
-        for _, row in prioridade.iterrows():
-            atraso = int(row["dias_sem_comprar"] - row["intervalo"])
-            st.markdown(f"""
-### {row['Cliente']}
-
-Compra a cada **{int(row['intervalo'])} dias**  
-Está há **{int(row['dias_sem_comprar'])} dias** sem comprar  
-Já era para ter comprado há **{max(atraso, 0)} dias**
-
-Ticket médio: **{fmt(row['ticket_medio'])}**  
-Orçamentos em aberto: **{int(row['orcamentos_em_aberto'])}**  
-Inadimplência: **{fmt(row['inadimplencia'])}**  
-Score de risco: **{int(row['score_risco'])}/100 — {row['risco_inadimplencia']}**
-
-🤖 **IA:** {row['acao_ia']}
-""")
-            with st.expander("Ver orçamentos em aberto"):
-                if row["numeros_orcamentos"]:
-                    for num in row["numeros_orcamentos"]:
-                        st.write(f"• Orçamento Nº {num}")
-                else:
-                    st.write("Nenhum orçamento em aberto.")
-
-            if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_prioridade_{row['Cliente']}"):
-                st.session_state.clientes_ligados.add(row["Cliente"])
-                st.rerun()
-
-            st.markdown("---")
+        cards = list(prioridade.iterrows())
+        for i in range(0, len(cards), 3):
+            cols = st.columns(3)
+            for j, (_, row) in enumerate(cards[i:i+3]):
+                with cols[j]:
+                    card_cliente(row, "prioridade")
 
     with aba_resumo:
         st.subheader("📋 Resumo Comercial")
         st.markdown(f"**Capacidade de venda do resumo:** **{fmt(resumo['ticket_medio'].sum())}**")
 
-        for _, row in resumo.iterrows():
-            atraso = int(row["dias_sem_comprar"] - row["intervalo"])
-            st.markdown(f"""
-### {row['Cliente']}
-
-Compra a cada **{int(row['intervalo'])} dias**  
-Está há **{int(row['dias_sem_comprar'])} dias** sem comprar  
-Diferença do ciclo: **{atraso} dias**
-
-Ticket médio: **{fmt(row['ticket_medio'])}**  
-Orçamentos em aberto: **{int(row['orcamentos_em_aberto'])}**  
-Inadimplência: **{fmt(row['inadimplencia'])}**  
-Score de risco: **{int(row['score_risco'])}/100 — {row['risco_inadimplencia']}**
-
-🤖 **IA:** {row['acao_ia']}
-""")
-            if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_resumo_{row['Cliente']}"):
-                st.session_state.clientes_ligados.add(row["Cliente"])
-                st.rerun()
-
-            st.markdown("---")
+        cards = list(resumo.iterrows())
+        for i in range(0, len(cards), 3):
+            cols = st.columns(3)
+            for j, (_, row) in enumerate(cards[i:i+3]):
+                with cols[j]:
+                    card_cliente(row, "resumo")
 
     with aba_orc:
         st.subheader("📄 Orçamentos em aberto para retorno")
@@ -358,6 +360,7 @@ Valor: <b>{valor_txt}</b>
         st.markdown(f"**Clientes analisados:** **{len(clientes)}**")
         st.markdown(f"**Clientes em prioridade:** **{len(prioridade)}**")
         st.markdown(f"**Clientes no resumo:** **{len(resumo)}**")
+        st.markdown(f"**Potencial mensal da carteira:** **{fmt(clientes['potencial_mensal'].sum())}**")
         st.markdown(f"**Inadimplência total:** **{fmt(clientes['inadimplencia'].sum())}**")
 
     with aba_base:
@@ -380,6 +383,7 @@ Valor: <b>{valor_txt}</b>
 <b>{r['Cliente']}</b><br>
 Faturamento: <b>{fmt(r['faturamento'])}</b><br>
 Ticket médio: <b>{fmt(r['ticket_medio'])}</b><br>
+Potencial mensal: <b>{fmt(r['potencial_mensal'])}</b><br>
 Compras: <b>{int(r['qtd_compras'])}</b><br>
 Intervalo médio: <b>{int(r['intervalo'])} dias</b><br>
 Última compra: <b>{r['ultima_compra'].strftime('%d/%m/%Y')}</b><br>
