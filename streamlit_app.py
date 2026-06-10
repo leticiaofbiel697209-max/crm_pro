@@ -1,198 +1,244 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from pathlib import Path
 
 st.set_page_config(layout="wide")
-st.title("CRM Inteligente - Nivel CEO")
-
-
-# =========================
-# FUNCOES
-# =========================
+st.title("📊 CRM Inteligente - Nível CEO")
 
 def formatar_real(valor):
     try:
         return f"R${valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
+    except:
         return "R$0,00"
 
+def ler_excel(file, header=0):
+    return pd.read_excel(file, header=header, engine="openpyxl")
 
 def achar_coluna(df, nomes):
-    for nome in df.columns:
-        for n in nomes:
-            if n.lower() in str(nome).lower():
-                return nome
+    for coluna in df.columns:
+        for nome in nomes:
+            if nome.lower() in str(coluna).lower():
+                return coluna
     return None
-
-
-def validar_colunas(colunas):
-    faltando = [nome for nome, valor in colunas.items() if valor is None]
-    if faltando:
-        raise ValueError("Colunas nao encontradas: " + ", ".join(faltando))
-
-
-def ler_arquivo(uploaded_file, header=0):
-    if uploaded_file is None:
-        raise ValueError("Envie todos os arquivos antes de analisar.")
-
-    nome = uploaded_file.name.lower()
-    extensao = Path(nome).suffix
-    uploaded_file.seek(0)
-
-    if extensao == ".xlsx":
-        return pd.read_excel(uploaded_file, header=header, engine="openpyxl")
-
-    if extensao == ".xls":
-        return pd.read_excel(uploaded_file, header=header, engine="xlrd")
-
-    if extensao in [".csv", ".txt"]:
-        try:
-            return pd.read_csv(uploaded_file, header=header, sep=None, engine="python", encoding="utf-8")
-        except UnicodeDecodeError:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, header=header, sep=None, engine="python", encoding="latin1")
-
-    raise ValueError(
-        f"Formato nao suportado para o arquivo '{uploaded_file.name}'. "
-        "Use .xlsx, .xls, .csv ou .txt."
-    )
-
 
 def sugestao_ia(dias_sem, intervalo, orcamentos):
     if intervalo == 0:
-        return "Cliente novo. Iniciar relacionamento."
-    if dias_sem > intervalo:
-        return "Cliente em atraso. Contato imediato com proposta direta."
-    if dias_sem >= intervalo * 0.8:
-        return "Cliente proximo do ciclo de compra. Fazer abordagem consultiva."
+        return "🟡 Cliente novo. Iniciar relacionamento comercial."
+
+    if dias_sem >= intervalo * 0.9 and dias_sem <= intervalo * 1.2:
+        return "🟢 Momento ideal. Ligar com oferta direta."
+
+    if dias_sem > intervalo * 1.2 and dias_sem <= intervalo * 2:
+        return "🔴 Cliente atrasado. Fazer contato de retomada urgente."
+
+    if dias_sem > intervalo * 2:
+        return "⚫ Cliente possivelmente perdido. Usar abordagem de reativação."
+
     if orcamentos > 0:
-        return "Follow-up de orcamento em aberto."
-    return "Cliente inativo. Reativacao com condicao especial."
+        return "📄 Cliente com orçamento em aberto. Priorizar follow-up."
 
-
-# =========================
-# UPLOAD
-# =========================
+    return "🔵 Ainda cedo. Manter relacionamento."
 
 st.sidebar.header("Importar Dados")
 
-tipos_aceitos = ["xlsx", "xls", "csv", "txt"]
-vendas_file = st.sidebar.file_uploader("Vendas", type=tipos_aceitos)
-orc_file = st.sidebar.file_uploader("Orcamentos", type=tipos_aceitos)
-contas_file = st.sidebar.file_uploader("Contas a Receber", type=tipos_aceitos)
+vendas_file = st.sidebar.file_uploader("Relatório de Vendas", type=["xlsx"])
+orc_file = st.sidebar.file_uploader("Relatório de Orçamentos", type=["xlsx"])
+contas_file = st.sidebar.file_uploader("Contas a Receber", type=["xlsx"])
 
 if st.sidebar.button("Analisar Dados"):
+
+    if not vendas_file or not orc_file or not contas_file:
+        st.error("Envie os três arquivos: vendas, orçamentos e contas a receber.")
+        st.stop()
+
     try:
-        vendas = ler_arquivo(vendas_file)
-        contas = ler_arquivo(contas_file)
-        orc = ler_arquivo(orc_file, header=1)
+        vendas = ler_excel(vendas_file)
+        contas = ler_excel(contas_file)
+        orc = ler_excel(orc_file, header=1)
 
-        # =========================
-        # IDENTIFICAR COLUNAS
-        # =========================
+        col_cliente = achar_coluna(vendas, ["cliente"])
+        col_data = achar_coluna(vendas, ["data"])
+        col_valor = achar_coluna(vendas, ["valor"])
 
-        col_cliente = achar_coluna(vendas, ["cliente", "razao", "nome"])
-        col_data = achar_coluna(vendas, ["data", "emissao"])
-        col_valor = achar_coluna(vendas, ["valor", "total"])
+        col_cliente_orc = achar_coluna(orc, ["cliente"])
+        col_numero_orc = achar_coluna(orc, ["nº", "numero", "número"])
+        col_data_orc = achar_coluna(orc, ["data"])
+        col_status_orc = achar_coluna(orc, ["situação", "situacao", "status"])
 
-        col_cliente_contas = achar_coluna(contas, ["cliente", "razao", "nome"])
-        col_valor_contas = achar_coluna(contas, ["valor", "total"])
-        col_venc = achar_coluna(contas, ["venc", "vencimento"])
-
-        col_cliente_orc = achar_coluna(orc, ["cliente", "razao", "nome"])
-        col_numero_orc = achar_coluna(orc, ["nº", "n°", "numero", "num", "orcamento"])
-        col_data_orc = achar_coluna(orc, ["data", "emissao"])
-        col_status_orc = achar_coluna(orc, ["situa", "status"])
-
-        validar_colunas({
-            "cliente em Vendas": col_cliente,
-            "data em Vendas": col_data,
-            "valor em Vendas": col_valor,
-            "cliente em Contas a Receber": col_cliente_contas,
-            "valor em Contas a Receber": col_valor_contas,
-            "vencimento em Contas a Receber": col_venc,
-            "cliente em Orcamentos": col_cliente_orc,
-            "numero em Orcamentos": col_numero_orc,
-            "data em Orcamentos": col_data_orc,
-            "status/situacao em Orcamentos": col_status_orc,
-        })
-
-        # =========================
-        # TRATAMENTO
-        # =========================
+        col_cliente_contas = achar_coluna(contas, ["cliente", "destinado"])
+        col_valor_contas = achar_coluna(contas, ["valor total", "valor"])
+        col_venc = achar_coluna(contas, ["vencimento"])
+        col_status_contas = achar_coluna(contas, ["situação", "situacao", "status"])
 
         vendas[col_data] = pd.to_datetime(vendas[col_data], dayfirst=True, errors="coerce")
-        contas[col_venc] = pd.to_datetime(contas[col_venc], dayfirst=True, errors="coerce")
         orc[col_data_orc] = pd.to_datetime(orc[col_data_orc], dayfirst=True, errors="coerce")
+        contas[col_venc] = pd.to_datetime(contas[col_venc], dayfirst=True, errors="coerce")
 
         vendas[col_valor] = pd.to_numeric(vendas[col_valor], errors="coerce").fillna(0)
         contas[col_valor_contas] = pd.to_numeric(contas[col_valor_contas], errors="coerce").fillna(0)
 
-        vendas = vendas.dropna(subset=[col_cliente, col_data])
-        contas = contas.dropna(subset=[col_cliente_contas, col_venc])
-        orc = orc.dropna(subset=[col_cliente_orc, col_data_orc])
-
-        if vendas.empty:
-            raise ValueError("A planilha de vendas nao tem linhas validas para analisar.")
-
-        hoje = pd.Timestamp(datetime.now())
-
-        # =========================
-        # BASE CLIENTES
-        # =========================
+        hoje = datetime.now()
 
         clientes = vendas.groupby(col_cliente).agg({
             col_data: ["max", "count"],
-            col_valor: "sum",
+            col_valor: "sum"
         })
 
-        clientes.columns = ["ultima_compra", "qtd", "faturamento"]
+        clientes.columns = ["ultima_compra", "qtd_compras", "faturamento"]
         clientes = clientes.reset_index()
         clientes.rename(columns={col_cliente: "Cliente"}, inplace=True)
 
         intervalo = vendas.sort_values(col_data).groupby(col_cliente)[col_data].apply(
-            lambda x: x.diff().mean().days if len(x) > 1 and pd.notna(x.diff().mean()) else 0
+            lambda x: x.diff().mean().days if len(x.dropna()) > 1 else 0
         )
 
         clientes["intervalo"] = clientes["Cliente"].map(intervalo).fillna(0)
         clientes["dias_sem_comprar"] = (hoje - clientes["ultima_compra"]).dt.days
+        clientes["ticket_medio"] = clientes["faturamento"] / clientes["qtd_compras"]
 
-        # =========================
-        # ORCAMENTOS
-        # =========================
+        orc_aberto = orc.copy()
 
-        orc_aberto = orc[orc[col_status_orc].astype(str).str.lower() != "concretizado"]
-        orc_aberto = orc_aberto[orc_aberto[col_data_orc] >= (hoje - pd.Timedelta(days=30))]
+        if col_status_orc:
+            orc_aberto = orc_aberto[
+                ~orc_aberto[col_status_orc].astype(str).str.upper().str.contains("CONCRETIZADO", na=False)
+            ]
+
+        orc_aberto = orc_aberto[
+            orc_aberto[col_data_orc] >= (hoje - pd.Timedelta(days=30))
+        ]
 
         orc_count = orc_aberto.groupby(col_cliente_orc)[col_numero_orc].count()
-        clientes["orcamentos"] = clientes["Cliente"].map(orc_count).fillna(0)
+        clientes["orcamentos_em_aberto"] = clientes["Cliente"].map(orc_count).fillna(0)
 
-        # =========================
-        # INADIMPLENCIA
-        # =========================
+        if col_status_contas:
+            contas_atraso = contas[
+                contas[col_status_contas].astype(str).str.upper().str.contains("ATRASADO|VENCIDO", na=False)
+            ]
+        else:
+            contas_atraso = contas[contas[col_venc] < hoje]
 
-        contas_atraso = contas[contas[col_venc] < hoje]
         inad = contas_atraso.groupby(col_cliente_contas)[col_valor_contas].sum()
         clientes["inadimplencia"] = clientes["Cliente"].map(inad).fillna(0)
 
-        # =========================
-        # IA
-        # =========================
-
-        clientes["acao"] = clientes.apply(
-            lambda x: sugestao_ia(x["dias_sem_comprar"], x["intervalo"], x["orcamentos"]),
-            axis=1,
+        clientes["acao_ia"] = clientes.apply(
+            lambda x: sugestao_ia(
+                x["dias_sem_comprar"],
+                x["intervalo"],
+                x["orcamentos_em_aberto"]
+            ),
+            axis=1
         )
 
-        # =========================
-        # ABAS
-        # =========================
+        prioridade = clientes[
+            (clientes["intervalo"] > 0) &
+            (clientes["dias_sem_comprar"] >= clientes["intervalo"] * 0.9) &
+            (clientes["dias_sem_comprar"] <= clientes["intervalo"] * 1.2)
+        ].sort_values("ticket_medio", ascending=False)
 
-        aba1, aba2, aba3, aba4, aba5 = st.tabs([
-            "Prioridade",
-            "Resumo",
-            "Orcamentos",
-            "Gestao",
-            "Base",
+        resumo = clientes[
+            (clientes["intervalo"] > 0) &
+            (clientes["dias_sem_comprar"] >= clientes["intervalo"] * 0.8)
+        ].sort_values("dias_sem_comprar", ascending=False)
+
+        aba_ceo, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base = st.tabs([
+            "👑 CEO",
+            "🔥 Prioridade",
+            "📋 Resumo",
+            "📄 Orçamentos",
+            "🧠 Gestão",
+            "📊 Base"
         ])
+
+        with aba_ceo:
+            st.subheader("👑 Painel CEO")
+
+            receita_prevista = clientes["faturamento"].sum()
+            capacidade_hoje = prioridade["ticket_medio"].sum()
+            inadimplencia_total = clientes["inadimplencia"].sum()
+
+            st.markdown(f"**Receita prevista:** **{formatar_real(receita_prevista)}**")
+            st.markdown(f"**Venda possível hoje:** **{formatar_real(capacidade_hoje)}**")
+            st.markdown(f"**Inadimplência real:** **{formatar_real(inadimplencia_total)}**")
+
+        with aba_prioridade:
+            st.subheader("🔥 Prioridade")
+
+            if prioridade.empty:
+                st.info("Nenhum cliente no timing ideal hoje.")
+
+            for _, row in prioridade.iterrows():
+                atraso = int(row["dias_sem_comprar"] - row["intervalo"])
+
+                st.markdown(f"""
+### {row['Cliente']}
+
+Compra a cada **{int(row['intervalo'])} dias**  
+Está há **{int(row['dias_sem_comprar'])} dias** sem comprar  
+Já era para ter comprado há **{max(atraso, 0)} dias**
+
+Ticket médio: **{formatar_real(row['ticket_medio'])}**  
+Orçamentos em aberto: **{int(row['orcamentos_em_aberto'])}**  
+Inadimplência: **{formatar_real(row['inadimplencia'])}**
+
+🤖 **IA:** {row['acao_ia']}
+
+---
+""")
+
+        with aba_resumo:
+            st.subheader("📋 Resumo Comercial")
+
+            capacidade_resumo = resumo["ticket_medio"].sum()
+            st.markdown(f"**Capacidade de venda do resumo:** **{formatar_real(capacidade_resumo)}**")
+
+            for _, row in resumo.iterrows():
+                atraso = int(row["dias_sem_comprar"] - row["intervalo"])
+
+                st.markdown(f"""
+### {row['Cliente']}
+
+Compra a cada **{int(row['intervalo'])} dias**  
+Está há **{int(row['dias_sem_comprar'])} dias** sem comprar  
+Diferença do ciclo: **{atraso} dias**
+
+Ticket médio: **{formatar_real(row['ticket_medio'])}**  
+Orçamentos em aberto: **{int(row['orcamentos_em_aberto'])}**  
+Inadimplência: **{formatar_real(row['inadimplencia'])}**
+
+🤖 **IA:** {row['acao_ia']}
+
+---
+""")
+
+        with aba_orc:
+            st.subheader("📄 Orçamentos em aberto para retorno")
+
+            if orc_aberto.empty:
+                st.info("Nenhum orçamento em aberto nos últimos 30 dias.")
+            else:
+                cols = [col_cliente_orc, col_numero_orc, col_data_orc]
+                if achar_coluna(orc_aberto, ["valor"]):
+                    cols.append(achar_coluna(orc_aberto, ["valor"]))
+
+                st.dataframe(orc_aberto[cols])
+
+        with aba_gestao:
+            st.subheader("🧠 Gestão")
+
+            st.markdown(f"**Clientes analisados:** **{len(clientes)}**")
+            st.markdown(f"**Clientes em prioridade:** **{len(prioridade)}**")
+            st.markdown(f"**Clientes no resumo:** **{len(resumo)}**")
+            st.markdown(f"**Inadimplência total:** **{formatar_real(clientes['inadimplencia'].sum())}**")
+
+        with aba_base:
+            st.subheader("📊 Base completa")
+
+            base = clientes.copy()
+            base["faturamento"] = base["faturamento"].apply(formatar_real)
+            base["ticket_medio"] = base["ticket_medio"].apply(formatar_real)
+            base["inadimplencia"] = base["inadimplencia"].apply(formatar_real)
+
+            st.dataframe(base)
+
+    except Exception as e:
+        st.error(f"Erro ao processar: {e}")
