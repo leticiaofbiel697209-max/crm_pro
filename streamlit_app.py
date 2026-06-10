@@ -1,6 +1,10 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from io import BytesIO
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
 st.set_page_config(layout="wide")
 st.title("📊 CRM Inteligente - Nível CEO")
@@ -89,9 +93,9 @@ def temperatura_cliente(dias, intervalo):
     if intervalo * 1.2 < dias <= intervalo * 1.5:
         return "🟡 ATENÇÃO"
     if intervalo * 1.5 < dias <= intervalo * 2:
-        return "🔴 ATRASADO"
+        return "🔴 ATRASADO NA RECOMPRA"
     if dias > intervalo * 2:
-        return "⚫ PERDIDO"
+        return "⚫ CLIENTE INATIVO"
     return "🔵 CEDO"
 
 def sugestao_ia(dias, intervalo, orcs, inad, potencial):
@@ -109,11 +113,11 @@ def sugestao_ia(dias, intervalo, orcs, inad, potencial):
     if temp == "🟡 ATENÇÃO":
         return "🟡 Cliente passou levemente do ciclo. Fazer contato de retomada antes que esfrie."
 
-    if temp == "🔴 ATRASADO":
-        return "🔴 Cliente atrasado. Abordagem urgente para entender se comprou de concorrente ou se esqueceu."
+    if temp == "🔴 ATRASADO NA RECOMPRA":
+        return "🔴 Cliente atrasado na recompra. Abordagem urgente para entender se comprou de concorrente ou se esqueceu."
 
-    if temp == "⚫ PERDIDO":
-        return "⚫ Cliente possivelmente perdido. Usar abordagem de reativação com condição especial."
+    if temp == "⚫ CLIENTE INATIVO":
+        return "⚫ Cliente inativo. Usar abordagem de reativação com condição especial."
 
     if orcs > 0:
         return "📄 Cliente com orçamento em aberto. Fazer follow-up comercial."
@@ -125,16 +129,15 @@ def sugestao_ia(dias, intervalo, orcs, inad, potencial):
 
 def score_comercial(row):
     score = 0
-
     temp = row["temperatura"]
 
     if temp == "🟢 QUENTE":
         score += 40
     elif temp == "🟡 ATENÇÃO":
         score += 30
-    elif temp == "🔴 ATRASADO":
+    elif temp == "🔴 ATRASADO NA RECOMPRA":
         score += 20
-    elif temp == "⚫ PERDIDO":
+    elif temp == "⚫ CLIENTE INATIVO":
         score += 10
 
     if row["orcamentos_em_aberto"] > 0:
@@ -271,7 +274,7 @@ def processar_dados(vendas_file, orc_file, contas_file):
     clientes["cliente_estrategico"] = clientes["faturamento"] >= limite_estrategico
 
     clientes["potencial_recuperavel"] = clientes.apply(
-        lambda x: x["potencial_mensal"] if x["temperatura"] in ["🔴 ATRASADO", "⚫ PERDIDO"] else 0,
+        lambda x: x["potencial_mensal"] if x["temperatura"] in ["🔴 ATRASADO NA RECOMPRA", "⚫ CLIENTE INATIVO"] else 0,
         axis=1
     )
 
@@ -305,13 +308,12 @@ def montar_prioridade(clientes):
 
 def montar_resumo(clientes):
     return clientes[
-        (clientes["temperatura"].isin(["🟢 QUENTE", "🟡 ATENÇÃO", "🔴 ATRASADO", "⚫ PERDIDO"])) &
+        (clientes["temperatura"].isin(["🟢 QUENTE", "🟡 ATENÇÃO", "🔴 ATRASADO NA RECOMPRA", "⚫ CLIENTE INATIVO"])) &
         (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
     ].sort_values("score_comercial", ascending=False)
 
 def card_cliente(row, tipo):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
-
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
 
     st.markdown(f"""
@@ -374,7 +376,7 @@ def gerar_texto_email(prioridade, resumo, orc_aberto, clientes):
 
     linhas.append("")
     linhas.append("CLIENTES EM RECUPERAÇÃO:")
-    recuperacao = resumo[resumo["temperatura"].isin(["🔴 ATRASADO", "⚫ PERDIDO"])].head(10)
+    recuperacao = resumo[resumo["temperatura"].isin(["🔴 ATRASADO NA RECOMPRA", "⚫ CLIENTE INATIVO"])].head(10)
     if recuperacao.empty:
         linhas.append("- Nenhum.")
     else:
@@ -384,6 +386,61 @@ def gerar_texto_email(prioridade, resumo, orc_aberto, clientes):
             )
 
     return "\n".join(linhas)
+
+def gerar_pdf(prioridade, resumo, orc_aberto, clientes):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer)
+    styles = getSampleStyleSheet()
+    elementos = []
+
+    elementos.append(Paragraph("RELATÓRIO COMERCIAL", styles["Title"]))
+    elementos.append(Paragraph(datetime.now().strftime("%d/%m/%Y"), styles["Normal"]))
+    elementos.append(Spacer(1, 20))
+
+    elementos.append(Paragraph(f"Venda possível hoje: {fmt(prioridade['ticket_medio'].sum())}", styles["Heading2"]))
+    elementos.append(Paragraph(f"Potencial mensal da carteira: {fmt(clientes['potencial_mensal'].sum())}", styles["Heading2"]))
+    elementos.append(Paragraph(f"Potencial recuperável: {fmt(clientes['potencial_recuperavel'].sum())}", styles["Heading2"]))
+    elementos.append(Paragraph(f"Inadimplência real: {fmt(clientes['inadimplencia'].sum())}", styles["Heading2"]))
+
+    elementos.append(Spacer(1, 20))
+    elementos.append(Paragraph("CLIENTES PRIORITÁRIOS", styles["Heading1"]))
+
+    if prioridade.empty:
+        elementos.append(Paragraph("Nenhum cliente prioritário hoje.", styles["Normal"]))
+    else:
+        for _, r in prioridade.head(20).iterrows():
+            texto = f"""
+            <b>{r['Cliente']}</b><br/>
+            Temperatura: {r['temperatura']}<br/>
+            Ticket médio: {fmt(r['ticket_medio'])}<br/>
+            Potencial mensal: {fmt(r['potencial_mensal'])}<br/>
+            Ação: {r['acao_ia']}
+            """
+            elementos.append(Paragraph(texto, styles["Normal"]))
+            elementos.append(Spacer(1, 10))
+
+    elementos.append(Spacer(1, 20))
+    elementos.append(Paragraph("CLIENTES EM RECUPERAÇÃO", styles["Heading1"]))
+
+    recuperacao = resumo[resumo["temperatura"].isin(["🔴 ATRASADO NA RECOMPRA", "⚫ CLIENTE INATIVO"])].head(20)
+
+    if recuperacao.empty:
+        elementos.append(Paragraph("Nenhum cliente em recuperação.", styles["Normal"]))
+    else:
+        for _, r in recuperacao.iterrows():
+            texto = f"""
+            <b>{r['Cliente']}</b><br/>
+            Temperatura: {r['temperatura']}<br/>
+            Potencial recuperável: {fmt(r['potencial_recuperavel'])}<br/>
+            Ação: {r['acao_ia']}
+            """
+            elementos.append(Paragraph(texto, styles["Normal"]))
+            elementos.append(Spacer(1, 10))
+
+    doc.build(elementos)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
 
 def renderizar():
     dados = st.session_state.dados_processados
@@ -396,8 +453,8 @@ def renderizar():
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
 
-    aba_ceo, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email = st.tabs([
-        "👑 CEO", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail"
+    aba_ceo, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
+        "👑 CEO", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
 
     with aba_ceo:
@@ -419,7 +476,7 @@ def renderizar():
         st.caption("Cálculo: soma do ticket médio dos clientes na aba Prioridade, dentro da janela ideal de recompra e ainda não marcados como 'Já liguei'.")
 
         st.markdown(f"**Potencial recuperável:** **{fmt(potencial_recuperavel)}**")
-        st.caption("Cálculo: soma do potencial mensal dos clientes classificados como Atrasado ou Perdido.")
+        st.caption("Cálculo: soma do potencial mensal dos clientes classificados como Atrasado na Recompra ou Cliente Inativo.")
 
         st.markdown(f"**Inadimplência real:** **{fmt(inadimplencia_total)}**")
         st.caption("Cálculo: soma das contas com status Atrasado/Vencido.")
@@ -428,7 +485,7 @@ def renderizar():
         st.markdown(f"📞 Clientes em prioridade: **{len(prioridade)}**")
         st.markdown(f"📋 Clientes no resumo: **{len(resumo)}**")
         st.markdown(f"📄 Orçamentos em aberto: **{len(orc_aberto)}**")
-        st.markdown(f"🚨 Clientes perdidos: **{len(clientes[clientes['temperatura'] == '⚫ PERDIDO'])}**")
+        st.markdown(f"🚨 Clientes inativos: **{len(clientes[clientes['temperatura'] == '⚫ CLIENTE INATIVO'])}**")
 
     with aba_prioridade:
         st.subheader("🔥 Prioridade")
@@ -544,16 +601,39 @@ IA: <b>{r['acao_ia']}</b>
 
     with aba_email:
         st.subheader("✉️ Resumo para E-mail")
-
         texto_email = gerar_texto_email(prioridade, resumo, orc_aberto, clientes)
-
         st.text_area("Copie e envie para as vendedoras:", texto_email, height=500)
-
         st.download_button(
             "Baixar resumo em .txt",
             data=texto_email,
             file_name="resumo_comercial.txt",
             mime="text/plain"
+        )
+
+    with aba_relatorio:
+        st.subheader("📧 Relatório Comercial")
+
+        st.markdown(f"""
+### Resumo Executivo
+
+💰 Venda possível hoje: **{fmt(prioridade['ticket_medio'].sum())}**
+
+📈 Potencial mensal da carteira: **{fmt(clientes['potencial_mensal'].sum())}**
+
+📉 Potencial recuperável: **{fmt(clientes['potencial_recuperavel'].sum())}**
+
+🚨 Clientes inativos: **{len(clientes[clientes['temperatura'] == '⚫ CLIENTE INATIVO'])}**
+
+📄 Orçamentos em aberto: **{len(orc_aberto)}**
+""")
+
+        pdf = gerar_pdf(prioridade, resumo, orc_aberto, clientes)
+
+        st.download_button(
+            "📄 Baixar Relatório PDF",
+            pdf,
+            file_name=f"Relatorio_Comercial_{datetime.now().strftime('%d_%m_%Y')}.pdf",
+            mime="application/pdf"
         )
 
 st.sidebar.header("Importar Dados")
