@@ -174,7 +174,6 @@ if st.sidebar.button("Analisar Dados"):
 
         contas_atraso = contas[contas[col_venc] < hoje]
         inad = contas_atraso.groupby(col_cliente_contas)[col_valor_contas].sum()
-
         clientes["inadimplencia"] = clientes["Cliente"].map(inad).fillna(0)
 
         # =========================
