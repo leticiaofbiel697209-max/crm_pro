@@ -28,6 +28,9 @@ def fmt(v):
     except:
         return "R$0,00"
 
+def fmt_html(v):
+    return fmt(v).replace("$", "&#36;")
+
 def norm(x):
     return str(x).strip().lower().replace("º", "o").replace("°", "o")
 
@@ -319,11 +322,11 @@ Score comercial: <b>{int(row['score_comercial'])}/100</b><br><br>
 Compra a cada <b>{int(row['intervalo'])} dias</b><br>
 Está há <b>{int(row['dias_sem_comprar'])} dias</b> sem comprar<br>
 Já era para ter comprado há <b>{max(atraso, 0)} dias</b><br><br>
-Ticket médio: <b>{fmt(row['ticket_medio'])}</b><br>
-Potencial mensal: <b>{fmt(row['potencial_mensal'])}</b><br>
-Potencial recuperável: <b>{fmt(row['potencial_recuperavel'])}</b><br>
+Ticket médio: <b>{fmt_html(row['ticket_medio'])}</b><br>
+Potencial mensal: <b>{fmt_html(row['potencial_mensal'])}</b><br>
+Potencial recuperável: <b>{fmt_html(row['potencial_recuperavel'])}</b><br>
 Orçamentos em aberto: <b>{int(row['orcamentos_em_aberto'])}</b><br>
-Inadimplência: <b>{fmt(row['inadimplencia'])}</b><br>
+Inadimplência: <b>{fmt_html(row['inadimplencia'])}</b><br>
 Score de risco: <b>{int(row['score_risco'])}/100 — {row['risco_inadimplencia']}</b><br><br>
 IA: <b>{row['acao_ia']}</b>
 </div>
@@ -429,19 +432,39 @@ def renderizar():
     with aba_ceo:
         st.subheader("👑 Painel CEO")
 
-        st.markdown(f"**Receita prevista:** **{fmt(clientes['faturamento'].sum())}**")
-        st.caption("Período: faturamento total contido no relatório de vendas importado.")
+        receita_prevista = clientes["faturamento"].sum()
+        potencial_mensal = clientes["potencial_mensal"].sum()
+        venda_hoje = prioridade["ticket_medio"].sum()
+        potencial_recuperavel = clientes["potencial_recuperavel"].sum()
+        inadimplencia = clientes["inadimplencia"].sum()
 
-        st.markdown(f"**Potencial mensal da carteira:** **{fmt(clientes['potencial_mensal'].sum())}**")
-        st.caption("Média mensal dos últimos 3 meses.")
+        st.markdown(f"**Receita prevista:** **{fmt(receita_prevista)}**")
+        st.caption("Soma do faturamento total existente no relatório de vendas importado. O período depende do arquivo enviado.")
 
-        st.markdown(f"**Venda possível hoje:** **{fmt(prioridade['ticket_medio'].sum())}**")
-        st.caption("Soma do ticket médio dos clientes na aba Prioridade.")
+        st.markdown(f"**Potencial mensal da carteira:** **{fmt(potencial_mensal)}**")
+        st.caption("Média mensal de compras dos últimos 3 meses. Soma todos os clientes com vendas nesse período.")
 
-        st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
-        st.caption("Soma do potencial mensal dos clientes atrasados na recompra ou inativos.")
+        st.markdown(f"**Venda possível hoje:** **{fmt(venda_hoje)}**")
+        st.caption("Soma do ticket médio dos clientes classificados como QUENTE na aba Prioridade.")
 
-        st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
+        st.markdown(f"**Potencial recuperável:** **{fmt(potencial_recuperavel)}**")
+        st.caption("Soma do potencial mensal dos clientes classificados como ATRASADO NA RECOMPRA ou CLIENTE INATIVO.")
+
+        st.markdown(f"**Inadimplência real:** **{fmt(inadimplencia)}**")
+        st.caption("Soma das contas com status Atrasado/Vencido no relatório de contas a receber.")
+
+        st.markdown("### Resumo executivo")
+        st.markdown("""
+- **Clientes em prioridade:** clientes no momento ideal de recompra.
+- **Clientes no resumo:** clientes quentes, em atenção, atrasados na recompra ou inativos.
+- **Orçamentos em aberto:** orçamentos não concretizados com até 30 dias no sistema.
+- **Clientes inativos:** clientes que passaram de 200% do ciclo médio de compra.
+""")
+
+        st.markdown(f"📞 Clientes em prioridade: **{len(prioridade)}**")
+        st.markdown(f"📋 Clientes no resumo: **{len(resumo)}**")
+        st.markdown(f"📄 Orçamentos em aberto: **{len(orc_aberto)}**")
+        st.markdown(f"🚨 Clientes inativos: **{len(clientes[clientes['temperatura'] == '⚫ CLIENTE INATIVO'])}**")
 
     with aba_prioridade:
         st.subheader("🔥 Prioridade")
@@ -480,7 +503,7 @@ def renderizar():
                 cols = st.columns(3)
                 for j, (_, r) in enumerate(cards[i:i+3]):
                     with cols[j]:
-                        valor_txt = fmt(r[co_valor]) if co_valor else "Sem valor"
+                        valor_txt = fmt_html(r[co_valor]) if co_valor else "Sem valor"
                         chave_obs = f"obs_orc_{r[co_num]}"
 
                         st.markdown(f"""
@@ -541,16 +564,16 @@ Valor: <b>{valor_txt}</b>
 {estrela}
 Temperatura: <b>{r['temperatura']}</b><br>
 Score comercial: <b>{int(r['score_comercial'])}/100</b><br>
-Faturamento: <b>{fmt(r['faturamento'])}</b><br>
-Ticket médio: <b>{fmt(r['ticket_medio'])}</b><br>
-Potencial mensal: <b>{fmt(r['potencial_mensal'])}</b><br>
-Potencial recuperável: <b>{fmt(r['potencial_recuperavel'])}</b><br>
+Faturamento: <b>{fmt_html(r['faturamento'])}</b><br>
+Ticket médio: <b>{fmt_html(r['ticket_medio'])}</b><br>
+Potencial mensal: <b>{fmt_html(r['potencial_mensal'])}</b><br>
+Potencial recuperável: <b>{fmt_html(r['potencial_recuperavel'])}</b><br>
 Compras: <b>{int(r['qtd_compras'])}</b><br>
 Intervalo médio: <b>{int(r['intervalo'])} dias</b><br>
 Última compra: <b>{r['ultima_compra'].strftime('%d/%m/%Y')}</b><br>
 Dias sem comprar: <b>{int(r['dias_sem_comprar'])}</b><br>
 Orçamentos em aberto: <b>{int(r['orcamentos_em_aberto'])}</b><br>
-Inadimplência: <b>{fmt(r['inadimplencia'])}</b><br>
+Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b><br>
 Score de risco: <b>{int(r['score_risco'])}/100 — {r['risco_inadimplencia']}</b><br>
 IA: <b>{r['acao_ia']}</b>
 </div>
@@ -577,6 +600,16 @@ IA: <b>{r['acao_ia']}</b>
 🚨 Clientes inativos: **{len(clientes[clientes['temperatura'] == '⚫ CLIENTE INATIVO'])}**
 
 📄 Orçamentos em aberto: **{len(orc_aberto)}**
+""")
+
+        st.markdown("""
+**O que este relatório considera:**
+
+- **Venda possível hoje:** soma do ticket médio dos clientes em prioridade.
+- **Potencial mensal da carteira:** média mensal dos últimos 3 meses.
+- **Potencial recuperável:** clientes atrasados na recompra ou inativos.
+- **Clientes inativos:** passaram de 200% do ciclo médio de compra.
+- **Orçamentos em aberto:** orçamentos não concretizados com até 30 dias.
 """)
 
         pdf = gerar_pdf(prioridade, resumo, clientes)
