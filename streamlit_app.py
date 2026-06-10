@@ -42,11 +42,22 @@ def conectar_google_sheets():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
+
+    service_account_info = dict(st.secrets["gcp_service_account"])
+
+    service_account_info["private_key"] = (
+        service_account_info["private_key"]
+        .replace("\\n", "\n")
+        .strip()
+    )
+
     creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
+        service_account_info,
         scopes=scope
     )
+
     gc = gspread.authorize(creds)
+
     return gc.open(NOME_PLANILHA)
 
 def aba_sheets(nome):
