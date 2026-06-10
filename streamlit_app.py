@@ -5,6 +5,9 @@ from datetime import datetime
 st.set_page_config(layout="wide")
 st.title("📊 CRM Inteligente - Nível CEO")
 
+if "clientes_ligados" not in st.session_state:
+    st.session_state.clientes_ligados = set()
+
 def fmt(v):
     try:
         return f"R${float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -61,6 +64,20 @@ def sugestao_ia(dias, intervalo, orcs):
     if orcs > 0:
         return "📄 Cliente com orçamento em aberto. Priorizar follow-up."
     return "🔵 Ainda cedo. Manter relacionamento."
+
+def status_orcamento(dias):
+    if dias <= 1:
+        return "✅ Aceitável"
+    if dias == 2:
+        return "📞 Ligar hoje"
+    if dias == 3:
+        return "⚠️ Está perdendo tempo"
+    return "🚨 Risco de ter perdido"
+
+def score_risco(media_atraso):
+    if pd.isna(media_atraso) or media_atraso <= 0:
+        return 100
+    return max(0, min(100, int(100 - media_atraso * 2)))
 
 st.sidebar.header("Importar Dados")
 vendas_file = st.sidebar.file_uploader("Relatório de Vendas", type=["xlsx"])
@@ -151,22 +168,37 @@ if st.sidebar.button("Analisar Dados"):
         ]
         orc_aberto = orc_aberto[
             orc_aberto[co_data] >= (hoje - pd.Timedelta(days=30))
-        ]
+        ].copy()
+
+        orc_aberto["dias_no_sistema"] = (hoje - orc_aberto[co_data]).dt.days
+        orc_aberto["ação_recomendada"] = orc_aberto["dias_no_sistema"].apply(status_orcamento)
 
         orc_count = orc_aberto.groupby(co_cli)[co_num].count()
         clientes["orcamentos_em_aberto"] = clientes["Cliente"].map(orc_count).fillna(0)
 
+        orc_nums = orc_aberto.groupby(co_cli)[co_num].apply(lambda x: list(x.astype(str)))
+        clientes["numeros_orcamentos"] = clientes["Cliente"].map(orc_nums).apply(lambda x: x if isinstance(x, list) else [])
+
         if cc_status:
             contas_atraso = contas[
                 contas[cc_status].astype(str).str.upper().str.contains("ATRASADO|VENCIDO", na=False)
-            ]
+            ].copy()
         elif cc_venc:
-            contas_atraso = contas[contas[cc_venc] < hoje]
+            contas_atraso = contas[contas[cc_venc] < hoje].copy()
         else:
-            contas_atraso = contas.iloc[0:0]
+            contas_atraso = contas.iloc[0:0].copy()
 
-        inad = contas_atraso.groupby(cc_cli)[cc_valor].sum()
+        if cc_venc and not contas_atraso.empty:
+            contas_atraso["dias_atraso"] = (hoje - contas_atraso[cc_venc]).dt.days.clip(lower=0)
+            media_atraso = contas_atraso.groupby(cc_cli)["dias_atraso"].mean()
+        else:
+            media_atraso = pd.Series(dtype=float)
+
+        inad = contas_atraso.groupby(cc_cli)[cc_valor].sum() if not contas_atraso.empty else pd.Series(dtype=float)
+
         clientes["inadimplencia"] = clientes["Cliente"].map(inad).fillna(0)
+        clientes["media_dias_atraso"] = clientes["Cliente"].map(media_atraso).fillna(0)
+        clientes["score_risco"] = clientes["media_dias_atraso"].apply(score_risco)
 
         clientes["acao_ia"] = clientes.apply(
             lambda x: sugestao_ia(x["dias_sem_comprar"], x["intervalo"], x["orcamentos_em_aberto"]),
@@ -176,7 +208,8 @@ if st.sidebar.button("Analisar Dados"):
         prioridade = clientes[
             (clientes["intervalo"] > 0) &
             (clientes["dias_sem_comprar"] >= clientes["intervalo"] * 0.9) &
-            (clientes["dias_sem_comprar"] <= clientes["intervalo"] * 1.2)
+            (clientes["dias_sem_comprar"] <= clientes["intervalo"] * 1.2) &
+            (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
         ].sort_values("ticket_medio", ascending=False)
 
         resumo = clientes[
@@ -190,58 +223,99 @@ if st.sidebar.button("Analisar Dados"):
 
         with aba_ceo:
             st.subheader("👑 Painel CEO")
-            st.markdown(f"**Receita prevista:** **{fmt(clientes['faturamento'].sum())}**")
-            st.markdown(f"**Venda possível hoje:** **{fmt(prioridade['ticket_medio'].sum())}**")
-            st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
+
+            receita_prevista = clientes["faturamento"].sum()
+            capacidade_hoje = prioridade["ticket_medio"].sum()
+            inadimplencia_total = clientes["inadimplencia"].sum()
+
+            st.markdown(f"**Receita prevista:** **{fmt(receita_prevista)}**")
+            st.caption("Cálculo: soma do faturamento histórico de todos os clientes analisados no relatório de vendas.")
+
+            st.markdown(f"**Venda possível hoje:** **{fmt(capacidade_hoje)}**")
+            st.caption("Cálculo: soma do ticket médio dos clientes que estão na aba Prioridade, ou seja, dentro da janela ideal de recompra e ainda não marcados como 'Já liguei'.")
+
+            st.markdown(f"**Inadimplência real:** **{fmt(inadimplencia_total)}**")
+            st.caption("Cálculo: soma das contas com status Atrasado/Vencido.")
 
         with aba_prioridade:
             st.subheader("🔥 Prioridade")
+
             if prioridade.empty:
                 st.info("Nenhum cliente no timing ideal hoje.")
+
             for _, row in prioridade.iterrows():
                 atraso = int(row["dias_sem_comprar"] - row["intervalo"])
                 st.markdown(f"""
 ### {row['Cliente']}
+
 Compra a cada **{int(row['intervalo'])} dias**  
 Está há **{int(row['dias_sem_comprar'])} dias** sem comprar  
-Já era para ter comprado há **{max(atraso, 0)} dias**  
+Já era para ter comprado há **{max(atraso, 0)} dias**
 
 Ticket médio: **{fmt(row['ticket_medio'])}**  
 Orçamentos em aberto: **{int(row['orcamentos_em_aberto'])}**  
 Inadimplência: **{fmt(row['inadimplencia'])}**  
+Score de risco: **{int(row['score_risco'])}/100**
 
 🤖 **IA:** {row['acao_ia']}
----
 """)
+                with st.expander("Ver orçamentos em aberto"):
+                    if row["numeros_orcamentos"]:
+                        for num in row["numeros_orcamentos"]:
+                            st.write(f"• Orçamento Nº {num}")
+                    else:
+                        st.write("Nenhum orçamento em aberto.")
+
+                if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_{row['Cliente']}"):
+                    st.session_state.clientes_ligados.add(row["Cliente"])
+                    st.rerun()
+
+                st.markdown("---")
 
         with aba_resumo:
             st.subheader("📋 Resumo Comercial")
             st.markdown(f"**Capacidade de venda do resumo:** **{fmt(resumo['ticket_medio'].sum())}**")
+
             for _, row in resumo.iterrows():
                 atraso = int(row["dias_sem_comprar"] - row["intervalo"])
                 st.markdown(f"""
 ### {row['Cliente']}
+
 Compra a cada **{int(row['intervalo'])} dias**  
 Está há **{int(row['dias_sem_comprar'])} dias** sem comprar  
-Diferença do ciclo: **{atraso} dias**  
+Diferença do ciclo: **{atraso} dias**
 
 Ticket médio: **{fmt(row['ticket_medio'])}**  
 Orçamentos em aberto: **{int(row['orcamentos_em_aberto'])}**  
 Inadimplência: **{fmt(row['inadimplencia'])}**  
+Score de risco: **{int(row['score_risco'])}/100**
 
 🤖 **IA:** {row['acao_ia']}
+
 ---
 """)
 
         with aba_orc:
             st.subheader("📄 Orçamentos em aberto para retorno")
+
             if orc_aberto.empty:
                 st.info("Nenhum orçamento em aberto nos últimos 30 dias.")
             else:
-                cols = [co_num, co_cli, co_data]
-                if co_valor:
-                    cols.append(co_valor)
-                st.dataframe(orc_aberto[cols])
+                cards = list(orc_aberto.iterrows())
+                for i in range(0, len(cards), 3):
+                    cols = st.columns(3)
+                    for j, (_, r) in enumerate(cards[i:i+3]):
+                        with cols[j]:
+                            valor_txt = fmt(r[co_valor]) if co_valor else "Sem valor"
+                            st.markdown(f"""
+<div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
+<b>Orçamento Nº {r[co_num]}</b><br>
+Cliente: <b>{r[co_cli]}</b><br>
+Tempo no sistema: <b>{int(r['dias_no_sistema'])} dia(s)</b><br>
+Status: <b>{r['ação_recomendada']}</b><br>
+Valor: <b>{valor_txt}</b>
+</div>
+""", unsafe_allow_html=True)
 
         with aba_gestao:
             st.subheader("🧠 Gestão")
@@ -252,10 +326,19 @@ Inadimplência: **{fmt(row['inadimplencia'])}**
 
         with aba_base:
             st.subheader("📊 Base completa")
+
+            acoes = ["Todas"] + sorted(clientes["acao_ia"].unique().tolist())
+            filtro_acao = st.selectbox("Filtrar por ação sugerida", acoes)
+
             base = clientes.copy()
+            if filtro_acao != "Todas":
+                base = base[base["acao_ia"] == filtro_acao]
+
+            base_exibicao = base.copy()
             for col in ["faturamento", "ticket_medio", "inadimplencia"]:
-                base[col] = base[col].apply(fmt)
-            st.dataframe(base)
+                base_exibicao[col] = base_exibicao[col].apply(fmt)
+
+            st.dataframe(base_exibicao)
 
     except Exception as e:
         st.error(f"Erro ao processar: {e}")
