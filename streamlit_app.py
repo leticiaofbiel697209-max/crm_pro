@@ -425,6 +425,20 @@ def calcular_churn(clientes):
     taxa = len(clientes_churn) / len(clientes_com_ciclo) * 100
     return taxa, len(clientes_churn), len(clientes_com_ciclo)
 
+def listar_clientes_churn(clientes):
+    churn = clientes[
+        (clientes["intervalo"] > 0) &
+        (clientes["dias_sem_comprar"] > clientes["intervalo"] * 2)
+    ].copy()
+    churn["limite_churn_dias"] = (churn["intervalo"] * 2).round().astype(int)
+    churn["dias_alem_limite"] = (
+        churn["dias_sem_comprar"] - churn["limite_churn_dias"]
+    ).clip(lower=0).astype(int)
+    return churn.sort_values(
+        ["potencial_mensal", "dias_alem_limite"],
+        ascending=[False, False]
+    )
+
 def card_cliente(row, tipo):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
@@ -530,9 +544,10 @@ def renderizar():
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
+    clientes_churn = listar_clientes_churn(clientes)
 
-    aba_ceo, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
-        "👑 CEO", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
+    aba_ceo, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
+        "👑 CEO", "📉 Churn", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
 
     with aba_ceo:
@@ -578,6 +593,42 @@ def renderizar():
         st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
         st.caption("Soma do potencial mensal dos clientes classificados como ATRASADO NA RECOMPRA ou CLIENTE INATIVO.")
         st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
+
+    with aba_churn:
+        st.subheader("📉 Clientes em churn")
+        st.caption(
+            "Clientes com ciclo de recompra conhecido que estão há mais de duas vezes "
+            "o intervalo médio sem comprar."
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Taxa de churn", f"{taxa_churn:.1f}%")
+        col2.metric("Clientes em churn", qtd_churn)
+        col3.metric(
+            "Potencial mensal em risco",
+            fmt(clientes_churn["potencial_mensal"].sum())
+        )
+
+        if clientes_churn.empty:
+            st.success("Nenhum cliente está classificado em churn.")
+        else:
+            for _, r in clientes_churn.iterrows():
+                cliente_html = html_seguro(r["Cliente"])
+                ultima_compra = r["ultima_compra"].strftime("%d/%m/%Y")
+                st.markdown(f"""
+<div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border-left:6px solid #d62728;border-top:1px solid #ddd;border-right:1px solid #ddd;border-bottom:1px solid #ddd;">
+<b>{cliente_html}</b><br>
+Última compra: <b>{ultima_compra}</b><br>
+Está há <b>{int(r['dias_sem_comprar'])} dias</b> sem comprar<br>
+Ciclo médio: <b>{int(r['intervalo'])} dias</b><br>
+Limite para churn: <b>{int(r['limite_churn_dias'])} dias</b><br>
+Passou do limite há: <b>{int(r['dias_alem_limite'])} dias</b><br><br>
+Faturamento histórico: <b>{fmt_html(r['faturamento'])}</b><br>
+Ticket médio: <b>{fmt_html(r['ticket_medio'])}</b><br>
+Potencial mensal em risco: <b>{fmt_html(r['potencial_mensal'])}</b><br>
+Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
+</div>
+""", unsafe_allow_html=True)
 
     with aba_prioridade:
         st.subheader("🔥 Prioridade")
