@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
+from html import escape
+import re
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -33,6 +35,9 @@ def fmt(v):
 
 def fmt_html(v):
     return fmt(v).replace("$", "&#36;")
+
+def html_seguro(v):
+    return escape(str(v), quote=True)
 
 def norm(x):
     return str(x).strip().lower().replace("º", "o").replace("°", "o")
@@ -143,10 +148,32 @@ def data_coluna(s):
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 def numero_coluna(s):
-    return pd.to_numeric(
-        s.astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
-        errors="coerce"
-    ).fillna(0)
+    def converter(v):
+        if pd.isna(v):
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+
+        texto = re.sub(r"[^\d,.\-]", "", str(v).strip())
+        if not texto:
+            return 0.0
+
+        if "," in texto and "." in texto:
+            if texto.rfind(",") > texto.rfind("."):
+                texto = texto.replace(".", "").replace(",", ".")
+            else:
+                texto = texto.replace(",", "")
+        elif "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        elif re.fullmatch(r"-?\d{1,3}(\.\d{3})+", texto):
+            texto = texto.replace(".", "")
+
+        try:
+            return float(texto)
+        except ValueError:
+            return 0.0
+
+    return s.apply(converter)
 
 def status_orcamento(dias):
     if dias <= 1:
@@ -173,7 +200,11 @@ def descricao_score(score):
 
 def temperatura_cliente(dias, intervalo):
     if intervalo <= 0:
-        return "🟣 NOVO"
+        if dias <= 30:
+            return "🟣 NOVO"
+        if dias <= 60:
+            return "🟡 ATENÇÃO"
+        return "⚫ CLIENTE INATIVO"
     if intervalo * 0.9 <= dias <= intervalo * 1.2:
         return "🟢 QUENTE"
     if intervalo * 1.2 < dias <= intervalo * 1.5:
@@ -295,8 +326,14 @@ def processar_dados(vendas_file, orc_file, contas_file):
     clientes["potencial_mensal"] = clientes["Cliente"].map(potencial_3m).fillna(0)
 
     orc_aberto = orc.copy()
+    status_fechado = (
+        "CONCRETIZADO|CANCELADO|PERDIDO|REPROVADO|FATURADO|"
+        "FINALIZADO|FECHADO|VENDIDO"
+    )
     orc_aberto = orc_aberto[
-        ~orc_aberto[co_status].astype(str).str.upper().str.contains("CONCRETIZADO", na=False)
+        ~orc_aberto[co_status].astype(str).str.upper().str.contains(
+            status_fechado, na=False, regex=True
+        )
     ]
     orc_aberto = orc_aberto[
         orc_aberto[co_data] >= (hoje - pd.Timedelta(days=30))
@@ -380,12 +417,16 @@ def montar_resumo(clientes):
 def card_cliente(row, tipo):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
+    cliente_html = html_seguro(row["Cliente"])
+    temperatura_html = html_seguro(row["temperatura"])
+    risco_html = html_seguro(row["risco_inadimplencia"])
+    acao_html = html_seguro(row["acao_ia"])
 
     st.markdown(f"""
 <div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
-<b>{row['Cliente']}</b><br>
+<b>{cliente_html}</b><br>
 {estrela}
-Temperatura: <b>{row['temperatura']}</b><br>
+Temperatura: <b>{temperatura_html}</b><br>
 Score comercial: <b>{int(row['score_comercial'])}/100</b><br><br>
 Compra a cada <b>{int(row['intervalo'])} dias</b><br>
 Está há <b>{int(row['dias_sem_comprar'])} dias</b> sem comprar<br>
@@ -395,8 +436,8 @@ Potencial mensal: <b>{fmt_html(row['potencial_mensal'])}</b><br>
 Potencial recuperável: <b>{fmt_html(row['potencial_recuperavel'])}</b><br>
 Orçamentos em aberto: <b>{int(row['orcamentos_em_aberto'])}</b><br>
 Inadimplência: <b>{fmt_html(row['inadimplencia'])}</b><br>
-Score de risco: <b>{int(row['score_risco'])}/100 — {row['risco_inadimplencia']}</b><br><br>
-IA: <b>{row['acao_ia']}</b>
+Score de risco: <b>{int(row['score_risco'])}/100 — {risco_html}</b><br><br>
+Recomendação: <b>{acao_html}</b>
 </div>
 """, unsafe_allow_html=True)
 
@@ -530,13 +571,16 @@ def renderizar():
                         valor_txt = fmt_html(r[co_valor]) if co_valor else "Sem valor"
                         chave_obs = f"obs_orc_{r[co_num]}"
                         num_orc = str(r[co_num])
+                        num_orc_html = html_seguro(r[co_num])
+                        cliente_orc_html = html_seguro(r[co_cli])
+                        status_orc_html = html_seguro(r["ação_recomendada"])
 
                         st.markdown(f"""
 <div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
-<b>Orçamento Nº {r[co_num]}</b><br>
-Cliente: <b>{r[co_cli]}</b><br>
+<b>Orçamento Nº {num_orc_html}</b><br>
+Cliente: <b>{cliente_orc_html}</b><br>
 Tempo no sistema: <b>{int(r['dias_no_sistema'])} dia(s)</b><br>
-Status: <b>{r['ação_recomendada']}</b><br>
+Status: <b>{status_orc_html}</b><br>
 Valor: <b>{valor_txt}</b>
 </div>
 """, unsafe_allow_html=True)
@@ -583,11 +627,15 @@ Valor: <b>{valor_txt}</b>
             for j, (_, r) in enumerate(cards[i:i+3]):
                 with cols[j]:
                     estrela = "⭐ Cliente estratégico<br>" if r["cliente_estrategico"] else ""
+                    cliente_html = html_seguro(r["Cliente"])
+                    temperatura_html = html_seguro(r["temperatura"])
+                    risco_html = html_seguro(r["risco_inadimplencia"])
+                    acao_html = html_seguro(r["acao_ia"])
                     st.markdown(f"""
 <div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
-<b>{r['Cliente']}</b><br>
+<b>{cliente_html}</b><br>
 {estrela}
-Temperatura: <b>{r['temperatura']}</b><br>
+Temperatura: <b>{temperatura_html}</b><br>
 Score comercial: <b>{int(r['score_comercial'])}/100</b><br>
 Faturamento: <b>{fmt_html(r['faturamento'])}</b><br>
 Ticket médio: <b>{fmt_html(r['ticket_medio'])}</b><br>
@@ -599,8 +647,8 @@ Intervalo médio: <b>{int(r['intervalo'])} dias</b><br>
 Dias sem comprar: <b>{int(r['dias_sem_comprar'])}</b><br>
 Orçamentos em aberto: <b>{int(r['orcamentos_em_aberto'])}</b><br>
 Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b><br>
-Score de risco: <b>{int(r['score_risco'])}/100 — {r['risco_inadimplencia']}</b><br>
-IA: <b>{r['acao_ia']}</b>
+Score de risco: <b>{int(r['score_risco'])}/100 — {risco_html}</b><br>
+Recomendação: <b>{acao_html}</b>
 </div>
 """, unsafe_allow_html=True)
 
