@@ -537,6 +537,38 @@ def renderizar():
 
     with aba_ceo:
         st.subheader("👑 Painel CEO")
+
+        col_churn, col_perdidos, col_base = st.columns(3)
+        with col_churn:
+            st.metric("Taxa de churn estimada", f"{taxa_churn:.1f}%")
+        with col_perdidos:
+            st.metric("Clientes em churn", qtd_churn)
+        with col_base:
+            st.metric("Base analisada", base_churn)
+
+        with st.expander("Como a taxa de churn foi calculada?"):
+            st.markdown(
+                """
+                **Fórmula**
+
+                `Taxa de churn = clientes em churn ÷ clientes com ciclo conhecido × 100`
+
+                Um cliente entra em **churn estimado** quando:
+
+                - possui pelo menos duas compras, permitindo calcular seu intervalo médio;
+                - está sem comprar há mais de duas vezes o seu intervalo médio de recompra.
+
+                **Exemplo:** se um cliente costuma comprar a cada 30 dias e está há mais
+                de 60 dias sem comprar, ele é considerado em churn. Clientes com apenas
+                uma compra não entram na base, pois ainda não possuem ciclo conhecido.
+                """
+            )
+            st.write(
+                f"Cálculo atual: {qtd_churn} ÷ {base_churn} × 100 = {taxa_churn:.1f}%"
+                if base_churn
+                else "Ainda não há clientes com histórico suficiente para calcular o churn."
+            )
+
         st.markdown(f"**Receita prevista:** **{fmt(clientes['faturamento'].sum())}**")
         st.caption("Soma do faturamento total existente no relatório de vendas importado. O período depende do arquivo enviado.")
         st.markdown(f"**Potencial mensal da carteira:** **{fmt(clientes['potencial_mensal'].sum())}**")
@@ -546,11 +578,6 @@ def renderizar():
         st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
         st.caption("Soma do potencial mensal dos clientes classificados como ATRASADO NA RECOMPRA ou CLIENTE INATIVO.")
         st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
-        st.markdown(f"**Taxa de churn estimada:** **{taxa_churn:.1f}%**")
-        st.caption(
-            f"{qtd_churn} de {base_churn} clientes com ciclo de recompra conhecido estão "
-            "há mais de duas vezes o intervalo médio sem comprar."
-        )
 
     with aba_prioridade:
         st.subheader("🔥 Prioridade")
