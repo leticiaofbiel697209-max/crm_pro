@@ -414,6 +414,17 @@ def montar_resumo(clientes):
         (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
     ].sort_values("score_comercial", ascending=False)
 
+def calcular_churn(clientes):
+    clientes_com_ciclo = clientes[clientes["intervalo"] > 0]
+    if clientes_com_ciclo.empty:
+        return 0.0, 0, 0
+
+    clientes_churn = clientes_com_ciclo[
+        clientes_com_ciclo["dias_sem_comprar"] > clientes_com_ciclo["intervalo"] * 2
+    ]
+    taxa = len(clientes_churn) / len(clientes_com_ciclo) * 100
+    return taxa, len(clientes_churn), len(clientes_com_ciclo)
+
 def card_cliente(row, tipo):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
@@ -518,6 +529,7 @@ def renderizar():
 
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
+    taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
 
     aba_ceo, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
         "👑 CEO", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
@@ -534,6 +546,11 @@ def renderizar():
         st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
         st.caption("Soma do potencial mensal dos clientes classificados como ATRASADO NA RECOMPRA ou CLIENTE INATIVO.")
         st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
+        st.markdown(f"**Taxa de churn estimada:** **{taxa_churn:.1f}%**")
+        st.caption(
+            f"{qtd_churn} de {base_churn} clientes com ciclo de recompra conhecido estão "
+            "há mais de duas vezes o intervalo médio sem comprar."
+        )
 
     with aba_prioridade:
         st.subheader("🔥 Prioridade")
@@ -604,6 +621,8 @@ Valor: <b>{valor_txt}</b>
         st.markdown(f"**Potencial mensal da carteira:** **{fmt(clientes['potencial_mensal'].sum())}**")
         st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
         st.markdown(f"**Inadimplência total:** **{fmt(clientes['inadimplencia'].sum())}**")
+        st.markdown(f"**Taxa de churn estimada:** **{taxa_churn:.1f}%**")
+        st.caption(f"Clientes em churn: {qtd_churn} | Base analisada: {base_churn}")
 
     with aba_base:
         st.subheader("📊 Base completa")
