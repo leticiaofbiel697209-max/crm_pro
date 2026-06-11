@@ -8,8 +8,14 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 try:
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    )
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
     REPORTLAB_OK = True
 except Exception:
     REPORTLAB_OK = False
@@ -340,7 +346,7 @@ def processar_dados(vendas_file, orc_file, contas_file):
     ].copy()
 
     orc_aberto["dias_no_sistema"] = (hoje - orc_aberto[co_data]).dt.days
-    orc_aberto["ação_recomendada"] = orc_aberto["dias_no_sistema"].apply(status_orcamento)
+    orc_aberto["acao_recomendada_orcamento"] = orc_aberto["dias_no_sistema"].apply(status_orcamento)
 
     orc_count = orc_aberto.groupby(co_cli)[co_num].count()
     clientes["orcamentos_em_aberto"] = clientes["Cliente"].map(orc_count).fillna(0)
@@ -400,6 +406,8 @@ def processar_dados(vendas_file, orc_file, contas_file):
         "co_cli": co_cli,
         "co_data": co_data,
         "co_valor": co_valor,
+        "periodo_inicio": vendas[cv_data].min(),
+        "periodo_fim": vendas[cv_data].max(),
     }
 
 def montar_prioridade(clientes):
@@ -478,57 +486,269 @@ Recomendação: <b>{acao_html}</b>
         salvar_cliente_ligado(row["Cliente"], tipo)
         st.rerun()
 
-def gerar_texto_email(prioridade, resumo, orc_aberto, clientes):
+def gerar_texto_email(
+    prioridade, orc_aberto, clientes, clientes_churn,
+    co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+):
     hoje_txt = datetime.now().strftime("%d/%m/%Y")
+    taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
+    periodo = f"{periodo_inicio:%d/%m/%Y} a {periodo_fim:%d/%m/%Y}"
+    orc_urgentes = orc_aberto[orc_aberto["dias_no_sistema"] >= 2].sort_values(
+        "dias_no_sistema", ascending=False
+    )
+    temperaturas = clientes["temperatura"].value_counts()
+
     linhas = [
-        f"Resumo Comercial - {hoje_txt}",
+        f"RESUMO COMERCIAL DIÁRIO - {hoje_txt}",
+        f"Período das vendas analisadas: {periodo}",
         "",
-        f"Clientes para ligar hoje: {len(prioridade)}",
-        f"Potencial mensal da carteira: {fmt(clientes['potencial_mensal'].sum())}",
-        f"Venda possível hoje: {fmt(prioridade['ticket_medio'].sum())}",
-        f"Potencial recuperável: {fmt(clientes['potencial_recuperavel'].sum())}",
-        f"Inadimplência real: {fmt(clientes['inadimplencia'].sum())}",
+        "VISÃO EXECUTIVA",
+        f"- Faturamento histórico importado: {fmt(clientes['faturamento'].sum())}",
+        f"- Potencial mensal da carteira: {fmt(clientes['potencial_mensal'].sum())}",
+        f"- Capacidade estimada das prioridades de hoje: {fmt(prioridade['ticket_medio'].sum())}",
+        f"- Potencial recuperável: {fmt(clientes['potencial_recuperavel'].sum())}",
+        f"- Inadimplência identificada: {fmt(clientes['inadimplencia'].sum())}",
+        f"- Churn estimado: {taxa_churn:.1f}% ({qtd_churn} de {base_churn} clientes com ciclo conhecido)",
         "",
-        "PRIORIDADE:"
+        "CARTEIRA",
+        f"- Quentes: {int(temperaturas.get('🟢 QUENTE', 0))}",
+        f"- Em atenção: {int(temperaturas.get('🟡 ATENÇÃO', 0))}",
+        f"- Atrasados na recompra: {int(temperaturas.get('🔴 ATRASADO NA RECOMPRA', 0))}",
+        f"- Inativos: {int(temperaturas.get('⚫ CLIENTE INATIVO', 0))}",
+        "",
+        f"PRIORIDADES DE HOJE ({len(prioridade)})"
     ]
-    for _, r in prioridade.head(10).iterrows():
-        linhas.append(f"- {r['Cliente']} | {r['temperatura']} | Ticket: {fmt(r['ticket_medio'])} | IA: {r['acao_ia']}")
+
+    if prioridade.empty:
+        linhas.append("- Nenhum cliente no timing ideal.")
+    else:
+        for i, (_, r) in enumerate(prioridade.head(10).iterrows(), 1):
+            linhas.append(
+                f"{i}. {r['Cliente']} | Ticket {fmt(r['ticket_medio'])} | "
+                f"Potencial {fmt(r['potencial_mensal'])} | {r['acao_ia']}"
+            )
+
+    linhas.extend(["", f"ORÇAMENTOS URGENTES ({len(orc_urgentes)})"])
+    if orc_urgentes.empty:
+        linhas.append("- Nenhum orçamento com dois dias ou mais sem retorno.")
+    else:
+        for i, (_, r) in enumerate(orc_urgentes.head(10).iterrows(), 1):
+            valor = fmt(r[co_valor]) if co_valor else "valor não informado"
+            linhas.append(
+                f"{i}. Nº {r[co_num]} | {r[co_cli]} | {int(r['dias_no_sistema'])} dias | {valor}"
+            )
+
+    linhas.extend(["", f"CHURN PARA RECUPERAÇÃO ({len(clientes_churn)})"])
+    if clientes_churn.empty:
+        linhas.append("- Nenhum cliente classificado em churn.")
+    else:
+        for i, (_, r) in enumerate(clientes_churn.head(10).iterrows(), 1):
+            linhas.append(
+                f"{i}. {r['Cliente']} | {int(r['dias_sem_comprar'])} dias sem comprar | "
+                f"Potencial em risco {fmt(r['potencial_mensal'])}"
+            )
+
+    linhas.extend([
+        "",
+        "PLANO DO DIA",
+        f"- Realizar {len(prioridade)} contatos prioritários.",
+        f"- Retornar {len(orc_urgentes)} orçamentos urgentes.",
+        f"- Iniciar recuperação dos {min(len(clientes_churn), 10)} clientes de churn com maior potencial.",
+        "- Tratar inadimplência antes de oferecer nova venda aos clientes com pendências.",
+        "",
+        "Observação: capacidade estimada não é previsão garantida; representa a soma dos tickets médios das prioridades."
+    ])
     return "\n".join(linhas)
 
-def gerar_pdf(prioridade, resumo, clientes):
+def gerar_pdf(
+    prioridade, orc_aberto, clientes, clientes_churn,
+    co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+):
     if not REPORTLAB_OK:
         return None
 
+    taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
+    periodo = f"{periodo_inicio:%d/%m/%Y} a {periodo_fim:%d/%m/%Y}"
+    orc_urgentes = orc_aberto[orc_aberto["dias_no_sistema"] >= 2].sort_values(
+        "dias_no_sistema", ascending=False
+    )
+
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=16 * mm,
+        title="Relatório Comercial Executivo"
+    )
     styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="TituloCEO", parent=styles["Title"], fontSize=20, leading=24,
+        textColor=colors.HexColor("#17324D"), alignment=TA_CENTER, spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name="SecaoCEO", parent=styles["Heading1"], fontSize=13, leading=16,
+        textColor=colors.HexColor("#17324D"), spaceBefore=10, spaceAfter=7
+    ))
+    styles.add(ParagraphStyle(
+        name="Pequeno", parent=styles["BodyText"], fontSize=8, leading=10
+    ))
+    styles.add(ParagraphStyle(
+        name="CabecalhoTabela", parent=styles["Pequeno"],
+        textColor=colors.white, fontName="Helvetica-Bold"
+    ))
     elementos = []
 
-    elementos.append(Paragraph("RELATÓRIO COMERCIAL", styles["Title"]))
-    elementos.append(Paragraph(datetime.now().strftime("%d/%m/%Y"), styles["Normal"]))
-    elementos.append(Spacer(1, 20))
-    elementos.append(Paragraph(f"Venda possível hoje: {fmt(prioridade['ticket_medio'].sum())}", styles["Heading2"]))
-    elementos.append(Paragraph(f"Potencial mensal da carteira: {fmt(clientes['potencial_mensal'].sum())}", styles["Heading2"]))
-    elementos.append(Paragraph(f"Potencial recuperável: {fmt(clientes['potencial_recuperavel'].sum())}", styles["Heading2"]))
-    elementos.append(Paragraph(f"Inadimplência real: {fmt(clientes['inadimplencia'].sum())}", styles["Heading2"]))
-    elementos.append(Spacer(1, 20))
-    elementos.append(Paragraph("CLIENTES PRIORITÁRIOS", styles["Heading1"]))
+    def p(valor, estilo="Pequeno"):
+        texto = re.sub(r"[\U00010000-\U0010ffff]", "", str(valor)).strip()
+        return Paragraph(escape(texto), styles[estilo])
 
-    if prioridade.empty:
-        elementos.append(Paragraph("Nenhum cliente prioritário hoje.", styles["Normal"]))
+    def tabela(dados, larguras=None):
+        cabecalho = [
+            Paragraph(escape(celula.getPlainText()), styles["CabecalhoTabela"])
+            if isinstance(celula, Paragraph)
+            else Paragraph(escape(str(celula)), styles["CabecalhoTabela"])
+            for celula in dados[0]
+        ]
+        dados = [cabecalho] + dados[1:]
+        tabela_pdf = Table(dados, colWidths=larguras, repeatRows=1, hAlign="LEFT")
+        tabela_pdf.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17324D")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B8C2CC")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F6F8")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        return tabela_pdf
+
+    elementos.append(Paragraph("RELATÓRIO COMERCIAL EXECUTIVO", styles["TituloCEO"]))
+    elementos.append(Paragraph(
+        f"Emitido em {datetime.now():%d/%m/%Y} | Vendas analisadas: {periodo}",
+        styles["Normal"]
+    ))
+    elementos.append(Spacer(1, 8))
+
+    indicadores = [
+        [p("Indicador"), p("Resultado"), p("Leitura")],
+        [p("Faturamento histórico"), p(fmt(clientes["faturamento"].sum())), p("Total existente no arquivo importado.")],
+        [p("Potencial mensal"), p(fmt(clientes["potencial_mensal"].sum())), p("Média mensal das compras dos últimos três meses.")],
+        [p("Capacidade das prioridades"), p(fmt(prioridade["ticket_medio"].sum())), p("Soma dos tickets médios; não é previsão garantida.")],
+        [p("Potencial recuperável"), p(fmt(clientes["potencial_recuperavel"].sum())), p("Potencial de atrasados e inativos.")],
+        [p("Inadimplência"), p(fmt(clientes["inadimplencia"].sum())), p("Pendências identificadas no contas a receber.")],
+        [p("Churn estimado"), p(f"{taxa_churn:.1f}%"), p(f"{qtd_churn} de {base_churn} clientes com ciclo conhecido.")],
+    ]
+    elementos.append(Paragraph("1. Painel executivo", styles["SecaoCEO"]))
+    elementos.append(tabela(indicadores, [45 * mm, 35 * mm, 80 * mm]))
+
+    temperaturas = clientes["temperatura"].value_counts()
+    carteira = [
+        [p("Situação"), p("Clientes")],
+        [p("Quentes"), p(int(temperaturas.get("🟢 QUENTE", 0)))],
+        [p("Em atenção"), p(int(temperaturas.get("🟡 ATENÇÃO", 0)))],
+        [p("Atrasados na recompra"), p(int(temperaturas.get("🔴 ATRASADO NA RECOMPRA", 0)))],
+        [p("Inativos"), p(int(temperaturas.get("⚫ CLIENTE INATIVO", 0)))],
+        [p("Novos"), p(int(temperaturas.get("🟣 NOVO", 0)))],
+    ]
+    elementos.append(Paragraph("2. Situação da carteira", styles["SecaoCEO"]))
+    elementos.append(tabela(carteira, [80 * mm, 35 * mm]))
+
+    elementos.append(Paragraph("3. Prioridades comerciais", styles["SecaoCEO"]))
+    prioridades_pdf = [[p("Cliente"), p("Dias"), p("Ticket"), p("Potencial"), p("Recomendação")]]
+    for _, r in prioridade.head(20).iterrows():
+        prioridades_pdf.append([
+            p(r["Cliente"]), p(int(r["dias_sem_comprar"])), p(fmt(r["ticket_medio"])),
+            p(fmt(r["potencial_mensal"])), p(r["acao_ia"])
+        ])
+    if len(prioridades_pdf) == 1:
+        elementos.append(Paragraph("Nenhum cliente no timing ideal hoje.", styles["Normal"]))
     else:
-        for _, r in prioridade.head(20).iterrows():
-            elementos.append(Paragraph(
-                f"<b>{r['Cliente']}</b><br/>"
-                f"Temperatura: {r['temperatura']}<br/>"
-                f"Ticket médio: {fmt(r['ticket_medio'])}<br/>"
-                f"Potencial mensal: {fmt(r['potencial_mensal'])}<br/>"
-                f"Ação: {r['acao_ia']}",
-                styles["Normal"]
-            ))
-            elementos.append(Spacer(1, 10))
+        elementos.append(tabela(prioridades_pdf, [38 * mm, 14 * mm, 25 * mm, 27 * mm, 56 * mm]))
 
-    doc.build(elementos)
+    elementos.append(PageBreak())
+    elementos.append(Paragraph("4. Churn e receita em risco", styles["SecaoCEO"]))
+    elementos.append(Paragraph(
+        f"Taxa estimada: <b>{taxa_churn:.1f}%</b>. Um cliente entra em churn quando "
+        "possui ciclo de recompra conhecido e ultrapassa duas vezes seu intervalo médio sem comprar.",
+        styles["BodyText"]
+    ))
+    elementos.append(Spacer(1, 6))
+    churn_pdf = [[p("Cliente"), p("Sem comprar"), p("Ciclo"), p("Além do limite"), p("Potencial em risco")]]
+    for _, r in clientes_churn.head(25).iterrows():
+        churn_pdf.append([
+            p(r["Cliente"]), p(f"{int(r['dias_sem_comprar'])} dias"),
+            p(f"{int(r['intervalo'])} dias"), p(f"{int(r['dias_alem_limite'])} dias"),
+            p(fmt(r["potencial_mensal"]))
+        ])
+    if len(churn_pdf) == 1:
+        elementos.append(Paragraph("Nenhum cliente classificado em churn.", styles["Normal"]))
+    else:
+        elementos.append(tabela(churn_pdf, [48 * mm, 27 * mm, 24 * mm, 30 * mm, 31 * mm]))
+
+    elementos.append(Paragraph("5. Orçamentos que exigem retorno", styles["SecaoCEO"]))
+    orc_pdf = [[p("Orçamento"), p("Cliente"), p("Dias"), p("Valor"), p("Prioridade")]]
+    for _, r in orc_urgentes.head(25).iterrows():
+        orc_pdf.append([
+            p(r[co_num]), p(r[co_cli]), p(int(r["dias_no_sistema"])),
+            p(fmt(r[co_valor]) if co_valor else "Não informado"), p(r["acao_recomendada_orcamento"])
+        ])
+    if len(orc_pdf) == 1:
+        elementos.append(Paragraph("Nenhum orçamento urgente.", styles["Normal"]))
+    else:
+        elementos.append(tabela(orc_pdf, [25 * mm, 50 * mm, 15 * mm, 28 * mm, 42 * mm]))
+
+    inadimplentes = clientes[clientes["inadimplencia"] > 0].sort_values(
+        "inadimplencia", ascending=False
+    )
+    elementos.append(Paragraph("6. Inadimplência por cliente", styles["SecaoCEO"]))
+    inad_pdf = [[p("Cliente"), p("Valor"), p("Média de atraso"), p("Risco")]]
+    for _, r in inadimplentes.head(25).iterrows():
+        inad_pdf.append([
+            p(r["Cliente"]), p(fmt(r["inadimplencia"])),
+            p(f"{int(r['media_dias_atraso'])} dias"), p(r["risco_inadimplencia"])
+        ])
+    if len(inad_pdf) == 1:
+        elementos.append(Paragraph("Nenhuma inadimplência identificada.", styles["Normal"]))
+    else:
+        elementos.append(tabela(inad_pdf, [55 * mm, 32 * mm, 32 * mm, 41 * mm]))
+
+    elementos.append(Paragraph("7. Plano de ação", styles["SecaoCEO"]))
+    elementos.append(Paragraph(
+        f"<b>Hoje:</b> realizar {len(prioridade)} contatos prioritários e retornar "
+        f"{len(orc_urgentes)} orçamentos urgentes.<br/>"
+        f"<b>Próximos 7 dias:</b> acompanhar clientes em atenção e propostas ainda abertas.<br/>"
+        f"<b>Recuperação:</b> abordar primeiro os {min(len(clientes_churn), 10)} clientes "
+        "em churn com maior potencial mensal e tratar pendências financeiras antes de uma nova oferta.",
+        styles["BodyText"]
+    ))
+
+    elementos.append(Paragraph("8. Metodologia", styles["SecaoCEO"]))
+    elementos.append(Paragraph(
+        "<b>Churn estimado:</b> clientes com ciclo conhecido e mais de duas vezes o intervalo "
+        "médio sem comprar, dividido pela quantidade de clientes com ciclo conhecido.<br/>"
+        "<b>Potencial mensal:</b> compras dos últimos três meses divididas por três.<br/>"
+        "<b>Capacidade das prioridades:</b> soma dos tickets médios dos clientes quentes; "
+        "não representa promessa de venda.<br/>"
+        "<b>Cliente estratégico:</b> cliente situado entre os 10% de maior faturamento histórico.",
+        styles["BodyText"]
+    ))
+
+    def rodape(canvas, documento):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#667788"))
+        canvas.drawString(15 * mm, 9 * mm, "CRM Inteligente - Relatório Comercial")
+        canvas.drawRightString(195 * mm, 9 * mm, f"Página {documento.page}")
+        canvas.restoreState()
+
+    doc.build(elementos, onFirstPage=rodape, onLaterPages=rodape)
     pdf = buffer.getvalue()
     buffer.close()
     return pdf
@@ -540,6 +760,8 @@ def renderizar():
     co_num = dados["co_num"]
     co_cli = dados["co_cli"]
     co_valor = dados["co_valor"]
+    periodo_inicio = dados.get("periodo_inicio", clientes["ultima_compra"].min())
+    periodo_fim = dados.get("periodo_fim", clientes["ultima_compra"].max())
 
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
@@ -668,7 +890,7 @@ Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
                         num_orc = str(r[co_num])
                         num_orc_html = html_seguro(r[co_num])
                         cliente_orc_html = html_seguro(r[co_cli])
-                        status_orc_html = html_seguro(r["ação_recomendada"])
+                        status_orc_html = html_seguro(r["acao_recomendada_orcamento"])
 
                         st.markdown(f"""
 <div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
@@ -751,18 +973,37 @@ Recomendação: <b>{acao_html}</b>
 
     with aba_email:
         st.subheader("✉️ Resumo para E-mail")
-        texto_email = gerar_texto_email(prioridade, resumo, orc_aberto, clientes)
-        st.text_area("Copie e envie para as vendedoras:", texto_email, height=500)
-        st.download_button("Baixar resumo em .txt", texto_email, "resumo_comercial.txt", "text/plain")
+        st.caption(
+            "Resumo diário e acionável para a equipe: indicadores, prioridades, "
+            "orçamentos urgentes, churn e plano do dia."
+        )
+        texto_email = gerar_texto_email(
+            prioridade, orc_aberto, clientes, clientes_churn,
+            co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+        )
+        st.text_area("Texto pronto para enviar:", texto_email, height=650)
+        st.download_button(
+            "Baixar resumo em .txt",
+            texto_email,
+            f"Resumo_Comercial_{datetime.now():%d_%m_%Y}.txt",
+            "text/plain"
+        )
 
     with aba_relatorio:
         st.subheader("📧 Relatório Comercial")
-        pdf = gerar_pdf(prioridade, resumo, clientes)
+        st.caption(
+            "Relatório executivo completo com período analisado, indicadores, carteira, "
+            "prioridades, churn, orçamentos, inadimplência, plano de ação e metodologia."
+        )
+        pdf = gerar_pdf(
+            prioridade, orc_aberto, clientes, clientes_churn,
+            co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+        )
         if pdf:
             st.download_button(
-                "📄 Baixar Relatório PDF",
+                "📄 Baixar Relatório Executivo em PDF",
                 pdf,
-                file_name=f"Relatorio_Comercial_{datetime.now().strftime('%d_%m_%Y')}.pdf",
+                file_name=f"Relatorio_Comercial_Executivo_{datetime.now():%d_%m_%Y}.pdf",
                 mime="application/pdf"
             )
         else:
