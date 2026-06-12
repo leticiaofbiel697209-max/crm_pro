@@ -38,6 +38,10 @@ if "gestaoclick_lojas" not in st.session_state:
     st.session_state.gestaoclick_lojas = []
 if "gestaoclick_usuarios" not in st.session_state:
     st.session_state.gestaoclick_usuarios = []
+if "alteracao_gestaoclick_pendente" not in st.session_state:
+    st.session_state.alteracao_gestaoclick_pendente = None
+if "metas_vendedor" not in st.session_state:
+    st.session_state.metas_vendedor = {}
 
 NOME_PLANILHA = "CRM_HISTORICO_LUKATONER"
 USUARIO_PADRAO = "Gabriel"
@@ -115,6 +119,9 @@ class GestaoClickAPI:
             "data_fim": end_date.isoformat(),
         })
 
+    def sale_statuses(self, store_id):
+        return self.list_all("/situacoes_vendas", {"loja_id": store_id})
+
     def budgets(self, start_date, end_date, store_id):
         return self.list_all("/orcamentos", {
             "loja_id": store_id,
@@ -169,6 +176,35 @@ class GestaoClickAPI:
             "data_fim": end_date.isoformat(),
             "liquidado": "pg",
         })
+
+def deduplicar_registros(registros):
+    unicos = {}
+    sem_id = []
+    for item in registros:
+        key = str(item.get("id") or "").strip()
+        if key:
+            unicos[key] = item
+        else:
+            sem_id.append(item)
+    return list(unicos.values()) + sem_id
+
+def custo_total_venda(item):
+    custo = 0.0
+    for campo in ("produtos", "servicos"):
+        for wrapper in item.get(campo) or []:
+            detalhe = wrapper.get("produto") or wrapper.get("servico") or {}
+            quantidade = pd.to_numeric(
+                pd.Series([detalhe.get("quantidade") or 1]), errors="coerce"
+            ).fillna(1).iloc[0]
+            custo_unitario = pd.to_numeric(
+                pd.Series([detalhe.get("valor_custo") or 0]), errors="coerce"
+            ).fillna(0).iloc[0]
+            custo += float(quantidade) * float(custo_unitario)
+    if custo == 0:
+        custo = float(pd.to_numeric(
+            pd.Series([item.get("valor_custo") or 0]), errors="coerce"
+        ).fillna(0).iloc[0])
+    return custo
 
     def budget(self, budget_id, store_id):
         return self.request(
@@ -727,18 +763,245 @@ def estrategia_financeira(metricas):
         )
     return dicas
 
+def calcular_financeiro_real(dados, configuracao):
+    vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    if vendas.empty:
+        return {}
+    data_col = achar_coluna(vendas, ["data"])
+    valor_col = achar_coluna(vendas, ["valor"])
+    custo_col = achar_coluna(vendas, ["custo"])
+    fim = pd.Timestamp(dados.get("periodo_fim", date.today()))
+    inicio_mes = fim.replace(day=1)
+    vendas_mes = vendas[
+        (vendas[data_col] >= inicio_mes) & (vendas[data_col] <= fim)
+    ].copy()
+    receita = float(vendas_mes[valor_col].sum())
+    custo = float(vendas_mes[custo_col].sum()) if custo_col else 0.0
+    lucro_bruto = receita - custo
+    impostos = receita * float(configuracao.get("impostos_pct", 0)) / 100
+    folha = float(configuracao.get("folha_mensal", 0))
+    despesas_fixas = float(configuracao.get("despesas_fixas", 0))
+    outras_despesas = float(configuracao.get("outras_despesas", 0))
+    lucro_operacional = (
+        lucro_bruto - impostos - folha - despesas_fixas - outras_despesas
+    )
+    margem_bruta = lucro_bruto / receita * 100 if receita else 0
+    margem_operacional = lucro_operacional / receita * 100 if receita else 0
+
+    financeiro = dados.get("financeiro", pd.DataFrame())
+    pagar = dados.get("contas_pagar", pd.DataFrame())
+    base_caixa = calcular_resultado_financeiro(
+        financeiro, pagar, dados.get("recebido_mes", 0), dados.get("pago_mes", 0)
+    )
+    saldo_inicial = float(configuracao.get("saldo_inicial", 0))
+    caixa_projetado_30 = saldo_inicial + base_caixa["saldo_30_dias"]
+
+    cenarios = {}
+    for nome, fator_receber in (
+        ("Conservador", 0.70), ("Provável", 0.90), ("Otimista", 1.00)
+    ):
+        cenarios[nome] = (
+            saldo_inicial +
+            base_caixa["total_aberto"] * fator_receber -
+            base_caixa["total_pagar"]
+        )
+    return {
+        "receita_mes": receita,
+        "custo_mes": custo,
+        "lucro_bruto": lucro_bruto,
+        "impostos_estimados": impostos,
+        "folha": folha,
+        "despesas_fixas": despesas_fixas,
+        "outras_despesas": outras_despesas,
+        "lucro_operacional": lucro_operacional,
+        "margem_bruta": margem_bruta,
+        "margem_operacional": margem_operacional,
+        "saldo_inicial": saldo_inicial,
+        "caixa_projetado_30": caixa_projetado_30,
+        "cenarios": cenarios,
+        "custos_disponiveis": bool(custo_col and vendas_mes[custo_col].gt(0).any()),
+    }
+
+def calcular_gestao_comercial(dados, configuracao):
+    vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    orcamentos = dados.get("orcamentos_todos", pd.DataFrame()).copy()
+    if vendas.empty:
+        return {}, pd.DataFrame()
+    data_col = achar_coluna(vendas, ["data"])
+    valor_col = achar_coluna(vendas, ["valor"])
+    custo_col = achar_coluna(vendas, ["custo"])
+    vendedor_col = achar_coluna(vendas, ["vendedor"])
+    fim = pd.Timestamp(dados.get("periodo_fim", date.today()))
+    inicio_mes = fim.replace(day=1)
+    vendas_mes = vendas[
+        (vendas[data_col] >= inicio_mes) & (vendas[data_col] <= fim)
+    ].copy()
+    if not vendedor_col:
+        vendas_mes["Vendedor"] = "Sem vendedor"
+        vendedor_col = "Vendedor"
+    resumo = vendas_mes.groupby(vendedor_col).agg(
+        Faturamento=(valor_col, "sum"),
+        Vendas=(valor_col, "count"),
+        Ticket_medio=(valor_col, "mean"),
+    )
+    if custo_col:
+        custos = vendas_mes.groupby(vendedor_col)[custo_col].sum()
+        resumo["Custo"] = resumo.index.map(custos).fillna(0)
+    else:
+        resumo["Custo"] = 0.0
+    resumo["Margem"] = resumo["Faturamento"] - resumo["Custo"]
+    resumo["Margem_pct"] = (
+        resumo["Margem"] / resumo["Faturamento"].replace(0, pd.NA) * 100
+    ).fillna(0)
+
+    meta_geral = float(configuracao.get("meta_geral", 0))
+    metas_vendedor = configuracao.get("metas_vendedor", {})
+    resumo["Meta"] = [
+        float(metas_vendedor.get(str(vendedor), 0))
+        for vendedor in resumo.index
+    ]
+    resumo["Atingimento_pct"] = (
+        resumo["Faturamento"] / resumo["Meta"].replace(0, pd.NA) * 100
+    ).fillna(0)
+    resumo["Distancia_meta"] = (resumo["Meta"] - resumo["Faturamento"]).clip(lower=0)
+
+    dias_decorridos = max(1, fim.day)
+    dias_mes = int((fim + pd.offsets.MonthEnd(0)).day)
+    projecao = float(vendas_mes[valor_col].sum()) / dias_decorridos * dias_mes
+
+    conversao = 0.0
+    perdidos = 0
+    idade_media_abertos = 0.0
+    motivos_perda = pd.DataFrame()
+    total_orc = len(orcamentos)
+    if total_orc:
+        status_col = achar_coluna(orcamentos, ["situacao", "status"])
+        data_orc_col = achar_coluna(orcamentos, ["data"])
+        status = orcamentos[status_col].astype(str).str.upper()
+        convertidos = status.str.contains(
+            "CONCRETIZ|FATURAD|VENDID|FECHAD|CONFIRMAD", na=False, regex=True
+        ).sum()
+        perdidos = status.str.contains(
+            "PERDID|CANCEL|REPROV", na=False, regex=True
+        ).sum()
+        conversao = convertidos / total_orc * 100
+        abertos = ~status.str.contains(
+            "CONCRETIZ|FATURAD|VENDID|FECHAD|CONFIRMAD|PERDID|CANCEL|REPROV",
+            na=False, regex=True
+        )
+        if data_orc_col and abertos.any():
+            idade_media_abertos = float(
+                (fim - pd.to_datetime(
+                    orcamentos.loc[abertos, data_orc_col], errors="coerce"
+                )).dt.days.mean()
+            )
+        notas_col = achar_coluna(orcamentos, ["observacoes internas", "observacoes"])
+        if notas_col and perdidos:
+            perdas = orcamentos[status.str.contains(
+                "PERDID|CANCEL|REPROV", na=False, regex=True
+            )].copy()
+            perdas["Motivo informado"] = perdas[notas_col].astype(str).str.strip()
+            perdas.loc[
+                perdas["Motivo informado"].isin(["", "nan", "None"]),
+                "Motivo informado"
+            ] = "Não informado"
+            motivos_perda = (
+                perdas["Motivo informado"].value_counts()
+                .head(10).rename_axis("Motivo").reset_index(name="Quantidade")
+            )
+    indicadores = {
+        "meta_geral": meta_geral,
+        "realizado": float(vendas_mes[valor_col].sum()),
+        "projecao": projecao,
+        "distancia_meta": max(0, meta_geral - float(vendas_mes[valor_col].sum())),
+        "conversao_orcamentos": conversao,
+        "orcamentos_total": total_orc,
+        "orcamentos_perdidos": int(perdidos),
+        "idade_media_abertos": idade_media_abertos,
+        "motivos_perda": motivos_perda,
+    }
+    return indicadores, resumo.reset_index().rename(columns={vendedor_col: "Vendedor"})
+
+def calcular_churn_avancado(dados):
+    clientes = dados["clientes"].copy()
+    vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    churn = listar_clientes_churn(clientes)
+    faturamento_total = float(clientes["faturamento"].sum())
+    churn_ponderado = (
+        float(churn["faturamento"].sum()) / faturamento_total * 100
+        if faturamento_total else 0.0
+    )
+    migrando = clientes[
+        (clientes["intervalo"] > 0) &
+        (clientes["dias_sem_comprar"] > clientes["intervalo"] * 1.2) &
+        (clientes["dias_sem_comprar"] <= clientes["intervalo"] * 2)
+    ].copy()
+
+    recuperados = set()
+    sazonais = set()
+    tendencia = []
+    if not vendas.empty:
+        data_col = achar_coluna(vendas, ["data"])
+        for chave, grupo in vendas.sort_values(data_col).groupby("_cliente_chave"):
+            intervalos = grupo[data_col].diff().dt.days.dropna()
+            if len(intervalos) >= 3:
+                media = intervalos.mean()
+                desvio = intervalos.std()
+                if media > 0 and desvio / media > 0.65:
+                    sazonais.add(str(chave))
+                if any(intervalos.iloc[:-1] > media * 2):
+                    recuperados.add(str(chave))
+        fim = pd.Timestamp(dados.get("periodo_fim", date.today()))
+        for meses_atras in range(5, -1, -1):
+            referencia = (fim - pd.DateOffset(months=meses_atras)) + pd.offsets.MonthEnd(0)
+            base = vendas[vendas[data_col] <= referencia]
+            conhecidos = 0
+            churn_mes = 0
+            for _chave, grupo in base.sort_values(data_col).groupby("_cliente_chave"):
+                datas = grupo[data_col].dropna()
+                if len(datas) < 2:
+                    continue
+                intervalo = datas.diff().dt.days.dropna().mean()
+                if intervalo <= 0:
+                    continue
+                conhecidos += 1
+                if (referencia - datas.max()).days > intervalo * 2:
+                    churn_mes += 1
+            tendencia.append({
+                "Mês": referencia.strftime("%m/%Y"),
+                "Churn %": churn_mes / conhecidos * 100 if conhecidos else 0.0
+            })
+    clientes["sazonal"] = clientes["Cliente ID"].astype(str).isin(sazonais)
+    churn["sazonal"] = churn["Cliente ID"].astype(str).isin(sazonais)
+    return {
+        "churn_ponderado": churn_ponderado,
+        "migrando": migrando,
+        "recuperados_historicos": len(recuperados),
+        "taxa_recuperacao_historica": (
+            len(recuperados) / max(1, int((clientes["intervalo"] > 0).sum())) * 100
+        ),
+        "sazonais": len(sazonais),
+        "tendencia_mensal": pd.DataFrame(tendencia),
+        "clientes_churn": churn,
+        "clientes": clientes,
+    }
+
 def processar_dataframes(vendas, orc, contas):
     hoje = datetime.now()
 
     cv_cli = achar_coluna(vendas, ["cliente"])
+    cv_cli_id = achar_coluna(vendas, ["cliente id"])
     cv_data = achar_coluna(vendas, ["data"])
     cv_valor = achar_coluna(vendas, ["valor"])
+    cv_custo = achar_coluna(vendas, ["custo"])
+    cv_status = achar_coluna(vendas, ["situacao", "status"])
     co_num = achar_coluna(orc, ["nº", "n°", "numero", "número"])
     co_cli = achar_coluna(orc, ["cliente"])
     co_data = achar_coluna(orc, ["data"])
     co_status = achar_coluna(orc, ["situação", "situacao", "status"])
     co_valor = achar_coluna(orc, ["valor"])
     cc_cli = achar_coluna(contas, ["cliente", "destinado"])
+    cc_cli_id = achar_coluna(contas, ["cliente id"])
     cc_venc = achar_coluna(contas, ["vencimento"])
     cc_status = achar_coluna(contas, ["situação", "situacao", "status"])
     cc_valor = achar_coluna(contas, ["valor total", "valor"])
@@ -762,7 +1025,29 @@ def processar_dataframes(vendas, orc, contas):
 
     vendas[cv_data] = data_coluna(vendas[cv_data])
     vendas[cv_valor] = numero_coluna(vendas[cv_valor])
+    if cv_custo:
+        vendas[cv_custo] = numero_coluna(vendas[cv_custo])
     vendas = vendas.dropna(subset=[cv_cli, cv_data])
+    vendas["_cliente_chave"] = (
+        vendas[cv_cli_id].astype(str).str.strip()
+        if cv_cli_id
+        else vendas[cv_cli].map(norm)
+    )
+    vendas.loc[
+        vendas["_cliente_chave"].isin(["", "none", "nan"]),
+        "_cliente_chave"
+    ] = vendas.loc[
+        vendas["_cliente_chave"].isin(["", "none", "nan"]), cv_cli
+    ].map(norm)
+    vendas["_cliente_nome"] = vendas[cv_cli].astype(str).str.strip()
+
+    vendas_canceladas = pd.DataFrame()
+    if cv_status:
+        cancelada = vendas[cv_status].astype(str).str.upper().str.contains(
+            "CANCEL|DEVOL|ESTORN|REPROV|PERDID", na=False, regex=True
+        )
+        vendas_canceladas = vendas[cancelada].copy()
+        vendas = vendas[~cancelada].copy()
 
     orc[co_data] = data_coluna(orc[co_data])
     if co_valor:
@@ -775,26 +1060,40 @@ def processar_dataframes(vendas, orc, contas):
         contas, cc_cli, cc_venc, cc_valor, cc_status
     )
 
-    clientes = vendas.groupby(cv_cli).agg({
+    contas["_cliente_chave"] = (
+        contas[cc_cli_id].astype(str).str.strip()
+        if cc_cli_id
+        else contas[cc_cli].map(norm)
+    )
+    contas.loc[
+        contas["_cliente_chave"].isin(["", "none", "nan"]),
+        "_cliente_chave"
+    ] = contas.loc[
+        contas["_cliente_chave"].isin(["", "none", "nan"]), cc_cli
+    ].map(norm)
+
+    clientes = vendas.groupby("_cliente_chave").agg({
+        "_cliente_nome": "last",
         cv_data: ["max", "count"],
         cv_valor: "sum"
     })
-    clientes.columns = ["ultima_compra", "qtd_compras", "faturamento"]
-    clientes = clientes.reset_index().rename(columns={cv_cli: "Cliente"})
+    clientes.columns = ["Cliente", "ultima_compra", "qtd_compras", "faturamento"]
+    clientes = clientes.reset_index().rename(columns={"_cliente_chave": "Cliente ID"})
 
-    intervalo = vendas.sort_values(cv_data).groupby(cv_cli)[cv_data].apply(
+    intervalo = vendas.sort_values(cv_data).groupby("_cliente_chave")[cv_data].apply(
         lambda x: x.diff().mean().days if len(x.dropna()) > 1 else 0
     )
 
-    clientes["intervalo"] = clientes["Cliente"].map(intervalo).fillna(0)
+    clientes["intervalo"] = clientes["Cliente ID"].map(intervalo).fillna(0)
     clientes["dias_sem_comprar"] = (hoje - clientes["ultima_compra"]).dt.days
     clientes["ticket_medio"] = clientes["faturamento"] / clientes["qtd_compras"]
 
     data_limite_3m = hoje - pd.DateOffset(months=3)
     vendas_3m = vendas[vendas[cv_data] >= data_limite_3m].copy()
-    potencial_3m = vendas_3m.groupby(cv_cli)[cv_valor].sum() / 3
-    clientes["potencial_mensal"] = clientes["Cliente"].map(potencial_3m).fillna(0)
+    potencial_3m = vendas_3m.groupby("_cliente_chave")[cv_valor].sum() / 3
+    clientes["potencial_mensal"] = clientes["Cliente ID"].map(potencial_3m).fillna(0)
 
+    orcamentos_todos = orc.copy()
     orc_aberto = orc.copy()
     status_fechado = (
         "CONCRETIZADO|CANCELADO|PERDIDO|REPROVADO|FATURADO|"
@@ -833,10 +1132,12 @@ def processar_dataframes(vendas, orc, contas):
     else:
         media_atraso = pd.Series(dtype=float)
 
-    inad = contas_atraso.groupby(cc_cli)[cc_valor].sum() if not contas_atraso.empty else pd.Series(dtype=float)
+    inad = contas_atraso.groupby("_cliente_chave")[cc_valor].sum() if not contas_atraso.empty else pd.Series(dtype=float)
 
-    clientes["inadimplencia"] = clientes["Cliente"].map(inad).fillna(0)
-    clientes["media_dias_atraso"] = clientes["Cliente"].map(media_atraso).fillna(0)
+    if not contas_atraso.empty and "dias_atraso" in contas_atraso:
+        media_atraso = contas_atraso.groupby("_cliente_chave")["dias_atraso"].mean()
+    clientes["inadimplencia"] = clientes["Cliente ID"].map(inad).fillna(0)
+    clientes["media_dias_atraso"] = clientes["Cliente ID"].map(media_atraso).fillna(0)
     clientes["score_risco"] = clientes["media_dias_atraso"].apply(score_risco)
     clientes["risco_inadimplencia"] = clientes["score_risco"].apply(descricao_score)
 
@@ -863,14 +1164,38 @@ def processar_dataframes(vendas, orc, contas):
 
     clientes["score_comercial"] = clientes.apply(score_comercial, axis=1)
 
+    nomes_duplicados = (
+        vendas.groupby(vendas["_cliente_nome"].map(norm))["_cliente_chave"]
+        .nunique()
+    )
+    nomes_duplicados = nomes_duplicados[nomes_duplicados > 1]
+    qualidade = {
+        "vendas_canceladas": len(vendas_canceladas),
+        "vendas_sem_cliente_id": int(
+            vendas[cv_cli_id].isna().sum() if cv_cli_id else len(vendas)
+        ),
+        "clientes_nomes_duplicados": int(len(nomes_duplicados)),
+        "vendas_sem_custo": int(
+            vendas[cv_custo].le(0).sum() if cv_custo else len(vendas)
+        ),
+        "vendas_sem_vendedor": int(
+            vendas[achar_coluna(vendas, ["vendedor"])].astype(str)
+            .str.strip().isin(["", "Sem vendedor", "nan"]).sum()
+            if achar_coluna(vendas, ["vendedor"]) else len(vendas)
+        ),
+    }
+
     return {
         "clientes": clientes,
         "orc_aberto": orc_aberto,
+        "orcamentos_todos": orcamentos_todos,
         "co_num": co_num,
         "co_cli": co_cli,
         "co_data": co_data,
         "co_valor": co_valor,
         "financeiro": financeiro,
+        "vendas_validas": vendas,
+        "qualidade_dados": qualidade,
         "periodo_inicio": vendas[cv_data].min(),
         "periodo_fim": vendas[cv_data].max(),
     }
@@ -891,6 +1216,9 @@ def processar_dados(vendas_file, orc_file, contas_file):
     return dados
 
 def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_id=None):
+    vendas_api = deduplicar_registros(vendas_api)
+    orcamentos_api = deduplicar_registros(orcamentos_api)
+    recebimentos_api = deduplicar_registros(recebimentos_api)
     if vendedor_id:
         vendas_api = [
             item for item in vendas_api
@@ -903,15 +1231,22 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
 
     vendas = pd.DataFrame([{
         "Cliente": item.get("nome_cliente") or "Cliente sem nome",
+        "Cliente ID": item.get("cliente_id"),
         "Data": pd.to_datetime(item.get("data"), format="%Y-%m-%d", errors="coerce"),
         "Valor": item.get("valor_total") or 0,
+        "Custo": custo_total_venda(item),
+        "Situacao": item.get("nome_situacao") or "",
         "Vendedor": item.get("nome_vendedor") or "Sem vendedor",
+        "Observacoes": item.get("observacoes") or "",
+        "Observacoes internas": item.get("observacoes_interna") or "",
         "Vendedor ID": item.get("vendedor_id"),
+        "_venda_id": item.get("id"),
     } for item in vendas_api])
 
     orcamentos = pd.DataFrame([{
         "Numero": item.get("codigo") or item.get("id"),
         "Cliente": item.get("nome_cliente") or "Cliente sem nome",
+        "Cliente ID": item.get("cliente_id"),
         "Data": pd.to_datetime(item.get("data"), format="%Y-%m-%d", errors="coerce"),
         "Situacao": item.get("nome_situacao") or "",
         "Valor": item.get("valor_total") or 0,
@@ -922,6 +1257,7 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
 
     contas = pd.DataFrame([{
         "Cliente": item.get("nome_cliente") or "Cliente sem nome",
+        "Cliente ID": item.get("cliente_id"),
         "Vencimento": pd.to_datetime(
             item.get("data_vencimento"), format="%Y-%m-%d", errors="coerce"
         ),
@@ -935,22 +1271,29 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
     } for item in recebimentos_api])
 
     if vendas.empty:
-        vendas = pd.DataFrame(columns=["Cliente", "Data", "Valor", "Vendedor", "Vendedor ID"])
+        vendas = pd.DataFrame(columns=[
+            "Cliente", "Cliente ID", "Data", "Valor", "Custo", "Situacao",
+            "Vendedor", "Vendedor ID", "_venda_id"
+        ])
     if orcamentos.empty:
         orcamentos = pd.DataFrame(columns=[
-            "Numero", "Cliente", "Data", "Situacao", "Valor", "Vendedor",
+            "Numero", "Cliente", "Cliente ID", "Data", "Situacao", "Valor", "Vendedor",
+            "Observacoes", "Observacoes internas",
             "_orcamento_id", "_observacoes_interna"
         ])
     if contas.empty:
         contas = pd.DataFrame(columns=[
-            "Cliente", "Vencimento", "Valor Total", "Situacao", "Juros",
+            "Cliente", "Cliente ID", "Vencimento", "Valor Total", "Situacao", "Juros",
             "Desconto", "Forma Pagamento", "Loja", "_recebimento_id"
         ])
     return vendas, orcamentos, contas
 
-def processar_api(api, inicio, fim, loja_id, vendedor_id=None, vendedor_nome="Todos"):
+def processar_api(
+    api, inicio, fim, loja_id, vendedor_id=None, vendedor_nome="Todos",
+    configuracao=None
+):
     vendas_api = api.sales(inicio, fim, loja_id)
-    orcamentos_api = api.budgets(max(inicio, fim - timedelta(days=30)), fim, loja_id)
+    orcamentos_api = api.budgets(inicio, fim, loja_id)
     recebimentos_api = api.open_receivables(loja_id)
     pagamentos_api = api.open_payables(loja_id)
     inicio_mes = fim.replace(day=1)
@@ -981,6 +1324,7 @@ def processar_api(api, inicio, fim, loja_id, vendedor_id=None, vendedor_nome="To
         "pago_mes": pago_mes,
         "mes_resultado": fim.strftime("%m/%Y"),
         "resultado_financeiro_disponivel": True,
+        "configuracao": configuracao or {},
     })
     return dados
 
@@ -1640,6 +1984,131 @@ def renderizar_financeiro_ceo(
         for dica in estrategia_financeira(metricas):
             st.write(f"- {dica}")
 
+def renderizar_financeiro_real(dados):
+    configuracao = dados.get("configuracao", {})
+    real = calcular_financeiro_real(dados, configuracao)
+    st.markdown("---")
+    st.subheader("Resultado econômico e cenários")
+    if not real:
+        st.info("Não há vendas suficientes para calcular o resultado econômico.")
+        return
+    cols = st.columns(4)
+    cols[0].metric("Receita do mês", fmt(real["receita_mes"]))
+    cols[1].metric("Custo das vendas", fmt(real["custo_mes"]))
+    cols[2].metric("Lucro bruto", fmt(real["lucro_bruto"]))
+    cols[3].metric("Margem bruta", f"{real['margem_bruta']:.1f}%")
+    cols2 = st.columns(4)
+    cols2[0].metric("Impostos estimados", fmt(real["impostos_estimados"]))
+    cols2[1].metric("Folha + despesas", fmt(
+        real["folha"] + real["despesas_fixas"] + real["outras_despesas"]
+    ))
+    cols2[2].metric(
+        "Lucro operacional estimado",
+        fmt(real["lucro_operacional"]),
+        "Lucro" if real["lucro_operacional"] >= 0 else "Prejuízo"
+    )
+    cols2[3].metric("Margem operacional", f"{real['margem_operacional']:.1f}%")
+    if not real["custos_disponiveis"]:
+        st.warning(
+            "Os custos das vendas não estão preenchidos na API. O lucro bruto e "
+            "operacional podem estar superestimados."
+        )
+    st.markdown("#### Cenários de caixa")
+    cenarios = pd.DataFrame([
+        {"Cenário": nome, "Caixa projetado": valor}
+        for nome, valor in real["cenarios"].items()
+    ])
+    cenarios["Caixa projetado"] = cenarios["Caixa projetado"].map(fmt)
+    st.dataframe(cenarios, use_container_width=True, hide_index=True)
+    st.caption(
+        "Os cenários consideram 70%, 90% ou 100% da carteira a receber, "
+        "menos todas as contas a pagar registradas."
+    )
+
+def renderizar_gestao_comercial(dados):
+    indicadores, vendedores = calcular_gestao_comercial(
+        dados, dados.get("configuracao", {})
+    )
+    st.subheader("Gestão Comercial")
+    if not indicadores:
+        st.info("Não há dados comerciais suficientes.")
+        return
+    cols = st.columns(4)
+    cols[0].metric("Meta geral", fmt(indicadores["meta_geral"]))
+    cols[1].metric("Realizado no mês", fmt(indicadores["realizado"]))
+    cols[2].metric("Projeção de fechamento", fmt(indicadores["projecao"]))
+    cols[3].metric("Distância da meta", fmt(indicadores["distancia_meta"]))
+    cols2 = st.columns(3)
+    cols2[0].metric(
+        "Conversão de orçamentos",
+        f"{indicadores['conversao_orcamentos']:.1f}%"
+    )
+    cols2[1].metric("Orçamentos analisados", indicadores["orcamentos_total"])
+    cols2[2].metric(
+        "Idade média dos abertos",
+        f"{indicadores['idade_media_abertos']:.0f} dias"
+    )
+    st.caption(
+        "A conversão usa as situações dos orçamentos. Sem vínculo direto entre "
+        "orçamento e venda, o tempo exato até fechamento não pode ser afirmado."
+    )
+    if not vendedores.empty:
+        exibir = vendedores.copy()
+        for col in ("Faturamento", "Custo", "Margem", "Meta", "Distancia_meta"):
+            exibir[col] = exibir[col].map(fmt)
+        exibir["Ticket_medio"] = exibir["Ticket_medio"].map(fmt)
+        exibir["Margem_pct"] = exibir["Margem_pct"].map(lambda v: f"{v:.1f}%")
+        exibir["Atingimento_pct"] = exibir["Atingimento_pct"].map(
+            lambda v: f"{v:.1f}%"
+        )
+        exibir = exibir.rename(columns={
+            "Ticket_medio": "Ticket médio",
+            "Margem_pct": "Margem %",
+            "Atingimento_pct": "Atingimento %",
+            "Distancia_meta": "Distância da meta",
+        })
+        st.dataframe(exibir, use_container_width=True, hide_index=True)
+    st.markdown("#### Motivos de perda")
+    if indicadores["motivos_perda"].empty:
+        st.info(
+            "Nenhum motivo de perda foi encontrado nas observações dos orçamentos."
+        )
+    else:
+        st.dataframe(
+            indicadores["motivos_perda"],
+            use_container_width=True,
+            hide_index=True
+        )
+
+def renderizar_qualidade_dados(dados):
+    qualidade = dados.get("qualidade_dados", {})
+    st.subheader("Qualidade dos Dados")
+    cols = st.columns(5)
+    cols[0].metric("Vendas excluídas", qualidade.get("vendas_canceladas", 0))
+    cols[1].metric("Sem cliente ID", qualidade.get("vendas_sem_cliente_id", 0))
+    cols[2].metric("Nomes duplicados", qualidade.get("clientes_nomes_duplicados", 0))
+    cols[3].metric("Sem custo", qualidade.get("vendas_sem_custo", 0))
+    cols[4].metric("Sem vendedor", qualidade.get("vendas_sem_vendedor", 0))
+    problemas = sum(int(v) for v in qualidade.values())
+    if problemas:
+        st.warning(
+            "Há registros que podem reduzir a precisão dos indicadores. "
+            "Vendas canceladas e devolvidas foram excluídas automaticamente."
+        )
+    else:
+        st.success("Nenhum problema relevante foi detectado na base consultada.")
+    st.markdown(
+        """
+        **Regras aplicadas**
+
+        - clientes são consolidados por `cliente_id`; o nome é apenas para exibição;
+        - vendas canceladas, devolvidas, estornadas, reprovadas ou perdidas são excluídas;
+        - registros duplicados da API são removidos pelo ID;
+        - custos, vendedor e identificação ausentes são sinalizados;
+        - contas futuras não entram na inadimplência antes do vencimento.
+        """
+    )
+
     st.markdown("#### Clientes ativos com pendências")
     ativos_inadimplentes = clientes[
         clientes["inadimplencia"] > 0
@@ -1683,6 +2152,7 @@ def renderizar():
     resumo = montar_resumo(clientes)
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
     clientes_churn = listar_clientes_churn(clientes)
+    churn_avancado = calcular_churn_avancado(dados)
 
     if dados.get("origem") == "api":
         atualizado = dados.get("atualizado_em")
@@ -1695,8 +2165,10 @@ def renderizar():
     else:
         st.info("Dados carregados por arquivos Excel.")
 
-    aba_ceo, aba_financeiro, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
-        "👑 CEO", "💰 Financeiro CEO", "📉 Churn", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
+    aba_ceo, aba_financeiro, aba_comercial, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_qualidade, aba_base, aba_email, aba_relatorio = st.tabs([
+        "👑 CEO", "💰 Financeiro CEO", "🎯 Gestão Comercial", "📉 Churn",
+        "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão",
+        "✅ Qualidade", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
 
     with aba_ceo:
@@ -1748,6 +2220,10 @@ def renderizar():
             financeiro, contas_pagar, recebido_mes, pago_mes,
             mes_resultado, resultado_disponivel, clientes, clientes_churn
         )
+        renderizar_financeiro_real(dados)
+
+    with aba_comercial:
+        renderizar_gestao_comercial(dados)
 
     with aba_churn:
         st.subheader("📉 Clientes em churn")
@@ -1763,6 +2239,46 @@ def renderizar():
             "Potencial mensal em risco",
             fmt(clientes_churn["potencial_mensal"].sum())
         )
+        avancado = st.columns(4)
+        avancado[0].metric(
+            "Churn ponderado por valor",
+            f"{churn_avancado['churn_ponderado']:.1f}%"
+        )
+        avancado[1].metric(
+            "Migrando para churn",
+            len(churn_avancado["migrando"])
+        )
+        avancado[2].metric(
+            "Recuperações históricas",
+            churn_avancado["recuperados_historicos"],
+            f"{churn_avancado['taxa_recuperacao_historica']:.1f}% da base recorrente"
+        )
+        avancado[3].metric(
+            "Clientes sazonais",
+            churn_avancado["sazonais"]
+        )
+        st.caption(
+            "O churn ponderado considera o faturamento dos clientes perdidos. "
+            "Clientes sazonais são sinalizados separadamente por apresentarem ciclos irregulares."
+        )
+        if not churn_avancado["tendencia_mensal"].empty:
+            st.markdown("#### Evolução mensal do churn")
+            tendencia = churn_avancado["tendencia_mensal"].set_index("Mês")
+            st.line_chart(tendencia)
+        if not churn_avancado["migrando"].empty:
+            st.markdown("#### Clientes migrando para churn")
+            migrando = churn_avancado["migrando"][[
+                "Cliente", "dias_sem_comprar", "intervalo",
+                "potencial_mensal", "temperatura"
+            ]].copy()
+            migrando["potencial_mensal"] = migrando["potencial_mensal"].map(fmt)
+            migrando = migrando.rename(columns={
+                "dias_sem_comprar": "Dias sem comprar",
+                "intervalo": "Ciclo médio",
+                "potencial_mensal": "Potencial mensal",
+                "temperatura": "Situação",
+            })
+            st.dataframe(migrando, use_container_width=True, hide_index=True)
 
         if clientes_churn.empty:
             st.success("Nenhum cliente está classificado em churn.")
@@ -1853,22 +2369,67 @@ Valor: <b>{valor_txt}</b>
                                     orcamento_id = str(r.get("_orcamento_id") or "").strip()
                                     if not orcamento_id:
                                         raise RuntimeError("ID interno do orçamento não encontrado.")
-                                    api_gestaoclick().append_budget_note(
-                                        orcamento_id,
-                                        dados["loja_id"],
-                                        obs,
-                                        st.session_state.get(
-                                            "gc_usuario_nome", USUARIO_PADRAO
-                                        )
-                                    )
-                                    st.session_state.observacoes_orc[num_orc] = obs
-                                    st.success("Observação gravada diretamente no GestãoClick.")
+                                    st.session_state.alteracao_gestaoclick_pendente = {
+                                        "tipo": "observacao_orcamento",
+                                        "numero": num_orc,
+                                        "orcamento_id": orcamento_id,
+                                        "loja_id": dados["loja_id"],
+                                        "cliente": str(r[co_cli]),
+                                        "observacao": obs,
+                                    }
+                                    st.rerun()
                                 else:
                                     st.session_state.observacoes_orc[num_orc] = obs
                                     salvar_observacao_orcamento(num_orc, r[co_cli], obs)
                                     st.success("Observação salva no Google Sheets.")
                             except Exception as e:
                                 st.error(f"Não foi possível salvar a observação: {e}")
+
+                        pendente = st.session_state.alteracao_gestaoclick_pendente
+                        if (
+                            dados.get("origem") == "api" and pendente and
+                            pendente.get("numero") == num_orc
+                        ):
+                            st.warning(
+                                "Confirme a alteração no GestãoClick.\n\n"
+                                f"Orçamento: {num_orc}\n\n"
+                                f"Cliente: {pendente['cliente']}\n\n"
+                                f"Nova observação: {pendente['observacao']}"
+                            )
+                            confirmado = st.checkbox(
+                                "Revisei os dados e autorizo a gravação no GestãoClick.",
+                                key=f"confirmar_gc_{num_orc}"
+                            )
+                            col_confirmar, col_cancelar = st.columns(2)
+                            if col_confirmar.button(
+                                "Confirmar gravação",
+                                key=f"executar_gc_{num_orc}",
+                                disabled=not confirmado,
+                                type="primary"
+                            ):
+                                try:
+                                    api_gestaoclick().append_budget_note(
+                                        pendente["orcamento_id"],
+                                        pendente["loja_id"],
+                                        pendente["observacao"],
+                                        st.session_state.get(
+                                            "gc_usuario_nome", USUARIO_PADRAO
+                                        )
+                                    )
+                                    st.session_state.observacoes_orc[num_orc] = ""
+                                    st.session_state.alteracao_gestaoclick_pendente = None
+                                    st.success(
+                                        "Alteração confirmada e gravada no GestãoClick."
+                                    )
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Falha ao gravar no GestãoClick: {e}")
+                            if col_cancelar.button(
+                                "Cancelar",
+                                key=f"cancelar_gc_{num_orc}"
+                            ):
+                                st.session_state.alteracao_gestaoclick_pendente = None
+                                st.rerun()
 
     with aba_gestao:
         st.subheader("🧠 Gestão")
@@ -1880,6 +2441,9 @@ Valor: <b>{valor_txt}</b>
         st.markdown(f"**Inadimplência total:** **{fmt(clientes['inadimplencia'].sum())}**")
         st.markdown(f"**Taxa de churn estimada:** **{taxa_churn:.1f}%**")
         st.caption(f"Clientes em churn: {qtd_churn} | Base analisada: {base_churn}")
+
+    with aba_qualidade:
+        renderizar_qualidade_dados(dados)
 
     with aba_base:
         st.subheader("📊 Base completa")
@@ -2063,6 +2627,63 @@ if modo_dados == "API GestãoClick":
             "Para churn, recomenda-se analisar pelo menos 12 meses de vendas."
         )
 
+        with st.sidebar.expander("Metas e premissas financeiras"):
+            meta_geral = st.number_input(
+                "Meta geral mensal",
+                min_value=0.0,
+                value=float(st.session_state.get("meta_geral", 0.0)),
+                step=1000.0
+            )
+            st.session_state.meta_geral = meta_geral
+            vendedor_nome_config = vendedor.get("nome") or "Todos"
+            if vendedor_nome_config != "Todos":
+                meta_vendedor = st.number_input(
+                    f"Meta de {vendedor_nome_config}",
+                    min_value=0.0,
+                    value=float(
+                        st.session_state.metas_vendedor.get(
+                            vendedor_nome_config, 0.0
+                        )
+                    ),
+                    step=500.0
+                )
+                st.session_state.metas_vendedor[vendedor_nome_config] = meta_vendedor
+            saldo_inicial = st.number_input(
+                "Saldo bancário inicial",
+                value=float(st.session_state.get("saldo_inicial", 0.0)),
+                step=1000.0
+            )
+            impostos_pct = st.number_input(
+                "Impostos estimados sobre vendas (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(st.session_state.get("impostos_pct", 0.0)),
+                step=0.5
+            )
+            folha_mensal = st.number_input(
+                "Folha mensal",
+                min_value=0.0,
+                value=float(st.session_state.get("folha_mensal", 0.0)),
+                step=1000.0
+            )
+            despesas_fixas = st.number_input(
+                "Despesas fixas mensais não lançadas",
+                min_value=0.0,
+                value=float(st.session_state.get("despesas_fixas", 0.0)),
+                step=1000.0
+            )
+            outras_despesas = st.number_input(
+                "Outras despesas mensais não lançadas",
+                min_value=0.0,
+                value=float(st.session_state.get("outras_despesas", 0.0)),
+                step=500.0
+            )
+            st.session_state.saldo_inicial = saldo_inicial
+            st.session_state.impostos_pct = impostos_pct
+            st.session_state.folha_mensal = folha_mensal
+            st.session_state.despesas_fixas = despesas_fixas
+            st.session_state.outras_despesas = outras_despesas
+
         if st.sidebar.button("Atualizar dados do GestãoClick", type="primary"):
             try:
                 with st.spinner(
@@ -2076,7 +2697,16 @@ if modo_dados == "API GestãoClick":
                         fim_api,
                         loja_id,
                         vendedor.get("id") or None,
-                        vendedor.get("nome") or "Todos"
+                        vendedor.get("nome") or "Todos",
+                        {
+                            "meta_geral": meta_geral,
+                            "metas_vendedor": dict(st.session_state.metas_vendedor),
+                            "saldo_inicial": saldo_inicial,
+                            "impostos_pct": impostos_pct,
+                            "folha_mensal": folha_mensal,
+                            "despesas_fixas": despesas_fixas,
+                            "outras_despesas": outras_despesas,
+                        }
                     )
                 st.success("Dados atualizados pelo GestãoClick.")
                 st.rerun()
