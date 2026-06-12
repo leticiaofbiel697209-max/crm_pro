@@ -1369,7 +1369,16 @@ def listar_clientes_churn(clientes):
         ascending=[False, False]
     )
 
-def card_cliente(row, tipo):
+def chave_widget(valor):
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", str(valor)).strip("_") or "sem_id"
+
+def identificador_cliente(row, fallback=""):
+    cliente_id = str(row.get("Cliente ID", "")).strip()
+    if cliente_id and cliente_id.lower() not in {"nan", "none"}:
+        return cliente_id
+    return f"{norm(row.get('Cliente', 'cliente'))}_{fallback}"
+
+def card_cliente(row, tipo, posicao):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
     cliente_html = html_seguro(row["Cliente"])
@@ -1403,7 +1412,11 @@ Recomendação: <b>{acao_html}</b>
         else:
             st.write("Nenhum orçamento em aberto.")
 
-    if st.button(f"✅ Já liguei - {row['Cliente']}", key=f"liguei_{tipo}_{row['Cliente']}"):
+    cliente_uid = chave_widget(identificador_cliente(row, posicao))
+    if st.button(
+        f"✅ Já liguei - {row['Cliente']}",
+        key=f"liguei_{tipo}_{cliente_uid}_{posicao}"
+    ):
         st.session_state.clientes_ligados.add(row["Cliente"])
         salvar_cliente_ligado(row["Cliente"], tipo)
         st.rerun()
@@ -2327,9 +2340,9 @@ Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
         cards = list(prioridade.iterrows())
         for i in range(0, len(cards), 3):
             cols = st.columns(3)
-            for j, (_, row) in enumerate(cards[i:i+3]):
+            for j, (indice, row) in enumerate(cards[i:i+3]):
                 with cols[j]:
-                    card_cliente(row, "prioridade")
+                    card_cliente(row, "prioridade", f"{indice}_{i}_{j}")
 
     with aba_resumo:
         st.subheader("📋 Resumo Comercial")
@@ -2339,9 +2352,9 @@ Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
         cards = list(resumo.iterrows())
         for i in range(0, len(cards), 3):
             cols = st.columns(3)
-            for j, (_, row) in enumerate(cards[i:i+3]):
+            for j, (indice, row) in enumerate(cards[i:i+3]):
                 with cols[j]:
-                    card_cliente(row, "resumo")
+                    card_cliente(row, "resumo", f"{indice}_{i}_{j}")
 
     with aba_orc:
         st.subheader("📄 Orçamentos em aberto para retorno")
@@ -2351,11 +2364,15 @@ Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
             cards = list(orc_aberto.iterrows())
             for i in range(0, len(cards), 3):
                 cols = st.columns(3)
-                for j, (_, r) in enumerate(cards[i:i+3]):
+                for j, (indice, r) in enumerate(cards[i:i+3]):
                     with cols[j]:
                         valor_txt = fmt_html(r[co_valor]) if co_valor else "Sem valor"
-                        chave_obs = f"obs_orc_{r[co_num]}"
                         num_orc = str(r[co_num])
+                        orcamento_id = str(r.get("_orcamento_id", "")).strip()
+                        orcamento_uid = chave_widget(
+                            orcamento_id or f"{num_orc}_{indice}_{i}_{j}"
+                        )
+                        chave_obs = f"obs_orc_{orcamento_uid}"
                         num_orc_html = html_seguro(r[co_num])
                         cliente_orc_html = html_seguro(r[co_cli])
                         status_orc_html = html_seguro(r["acao_recomendada_orcamento"])
@@ -2380,7 +2397,10 @@ Valor: <b>{valor_txt}</b>
                             key=chave_obs
                         )
 
-                        if st.button(f"💾 Salvar observação {num_orc}", key=f"salvar_obs_{num_orc}"):
+                        if st.button(
+                            f"💾 Salvar observação {num_orc}",
+                            key=f"salvar_obs_{orcamento_uid}"
+                        ):
                             try:
                                 if not obs.strip():
                                     raise RuntimeError("Digite uma observação antes de salvar.")
@@ -2407,7 +2427,8 @@ Valor: <b>{valor_txt}</b>
                         pendente = st.session_state.alteracao_gestaoclick_pendente
                         if (
                             dados.get("origem") == "api" and pendente and
-                            pendente.get("numero") == num_orc
+                            pendente.get("numero") == num_orc and
+                            pendente.get("orcamento_id") == orcamento_id
                         ):
                             st.warning(
                                 "Confirme a alteração no GestãoClick.\n\n"
@@ -2417,12 +2438,12 @@ Valor: <b>{valor_txt}</b>
                             )
                             confirmado = st.checkbox(
                                 "Revisei os dados e autorizo a gravação no GestãoClick.",
-                                key=f"confirmar_gc_{num_orc}"
+                                key=f"confirmar_gc_{orcamento_uid}"
                             )
                             col_confirmar, col_cancelar = st.columns(2)
                             if col_confirmar.button(
                                 "Confirmar gravação",
-                                key=f"executar_gc_{num_orc}",
+                                key=f"executar_gc_{orcamento_uid}",
                                 disabled=not confirmado,
                                 type="primary"
                             ):
@@ -2445,7 +2466,7 @@ Valor: <b>{valor_txt}</b>
                                     st.error(f"Falha ao gravar no GestãoClick: {e}")
                             if col_cancelar.button(
                                 "Cancelar",
-                                key=f"cancelar_gc_{num_orc}"
+                                key=f"cancelar_gc_{orcamento_uid}"
                             ):
                                 st.session_state.alteracao_gestaoclick_pendente = None
                                 st.rerun()
