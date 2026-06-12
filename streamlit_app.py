@@ -925,6 +925,8 @@ def calcular_gestao_comercial(dados, configuracao):
 def calcular_churn_avancado(dados):
     clientes = dados["clientes"].copy()
     vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    if "Cliente ID" not in clientes.columns:
+        clientes["Cliente ID"] = clientes["Cliente"].map(norm)
     churn = listar_clientes_churn(clientes)
     faturamento_total = float(clientes["faturamento"].sum())
     churn_ponderado = (
@@ -972,6 +974,8 @@ def calcular_churn_avancado(dados):
                 "Churn %": churn_mes / conhecidos * 100 if conhecidos else 0.0
             })
     clientes["sazonal"] = clientes["Cliente ID"].astype(str).isin(sazonais)
+    if "Cliente ID" not in churn.columns:
+        churn["Cliente ID"] = churn["Cliente"].map(norm)
     churn["sazonal"] = churn["Cliente ID"].astype(str).isin(sazonais)
     return {
         "churn_ponderado": churn_ponderado,
