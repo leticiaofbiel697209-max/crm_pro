@@ -122,12 +122,25 @@ class GestaoClickAPI:
             "data_fim": end_date.isoformat(),
         })
 
-    def overdue_receivables(self, end_date, store_id):
-        return self.list_all("/recebimentos", {
-            "loja_id": store_id,
-            "data_fim": end_date.isoformat(),
-            "liquidado": "at",
-        })
+    def open_receivables(self, store_id):
+        records = []
+        seen = set()
+        for status in ("ab", "at"):
+            for item in self.list_all("/recebimentos", {
+                "loja_id": store_id,
+                "liquidado": status,
+            }):
+                key = str(item.get("id") or item.get("codigo") or "")
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                copy = dict(item)
+                copy["_status_financeiro"] = (
+                    "ATRASADO" if status == "at" else "EM ABERTO"
+                )
+                records.append(copy)
+        return records
 
     def budget(self, budget_id, store_id):
         return self.request(
@@ -412,6 +425,118 @@ def score_comercial(row):
         score += 20
     return min(score, 100)
 
+def preparar_financeiro(contas, col_cliente, col_vencimento, col_valor, col_status):
+    financeiro = pd.DataFrame({
+        "Cliente": contas[col_cliente].astype(str).str.strip(),
+        "Vencimento": (
+            contas[col_vencimento]
+            if col_vencimento
+            else pd.Series(pd.NaT, index=contas.index)
+        ),
+        "Valor": contas[col_valor],
+        "Situacao": (
+            contas[col_status].astype(str)
+            if col_status
+            else pd.Series("EM ABERTO", index=contas.index)
+        ),
+    })
+    financeiro["Vencimento"] = pd.to_datetime(
+        financeiro["Vencimento"], errors="coerce"
+    )
+    financeiro["Valor"] = pd.to_numeric(
+        financeiro["Valor"], errors="coerce"
+    ).fillna(0)
+    financeiro["Situacao"] = financeiro["Situacao"].str.upper().str.strip()
+
+    status_pago = "PAGO|LIQUIDADO|RECEBIDO|CONFIRMADO|QUITADO"
+    financeiro["Liquidado"] = financeiro["Situacao"].str.contains(
+        status_pago, na=False, regex=True
+    )
+    financeiro = financeiro[
+        (~financeiro["Liquidado"]) &
+        financeiro["Cliente"].ne("") &
+        financeiro["Vencimento"].notna() &
+        financeiro["Valor"].gt(0)
+    ].copy()
+
+    hoje = pd.Timestamp(date.today())
+    financeiro["Dias_para_vencer"] = (
+        financeiro["Vencimento"].dt.normalize() - hoje
+    ).dt.days
+    financeiro["Vencida"] = (
+        financeiro["Dias_para_vencer"].lt(0) |
+        financeiro["Situacao"].str.contains("ATRASADO|VENCIDO", na=False, regex=True)
+    )
+    financeiro["Dias_atraso"] = (
+        -financeiro["Dias_para_vencer"]
+    ).clip(lower=0)
+
+    def faixa(row):
+        dias = int(row["Dias_para_vencer"])
+        if row["Vencida"]:
+            atraso = int(row["Dias_atraso"])
+            if atraso <= 7:
+                return "Vencido até 7 dias"
+            if atraso <= 15:
+                return "Vencido de 8 a 15 dias"
+            if atraso <= 30:
+                return "Vencido de 16 a 30 dias"
+            if atraso <= 60:
+                return "Vencido de 31 a 60 dias"
+            return "Vencido acima de 60 dias"
+        if dias <= 7:
+            return "A vencer em até 7 dias"
+        if dias <= 15:
+            return "A vencer de 8 a 15 dias"
+        if dias <= 30:
+            return "A vencer de 16 a 30 dias"
+        if dias <= 60:
+            return "A vencer de 31 a 60 dias"
+        return "A vencer acima de 60 dias"
+
+    financeiro["Faixa"] = financeiro.apply(faixa, axis=1)
+    return financeiro.sort_values(["Vencida", "Vencimento"], ascending=[False, True])
+
+def calcular_metricas_financeiras(financeiro):
+    vazio = {
+        "total_aberto": 0.0,
+        "total_vencido": 0.0,
+        "percentual_vencido": 0.0,
+        "vence_7": 0.0,
+        "vence_15": 0.0,
+        "vence_30": 0.0,
+        "prazo_medio": 0.0,
+        "concentracao_top5": 0.0,
+        "clientes_devedores": 0,
+    }
+    if financeiro is None or financeiro.empty:
+        return vazio
+
+    total = float(financeiro["Valor"].sum())
+    vencido = float(financeiro.loc[financeiro["Vencida"], "Valor"].sum())
+    futuro = financeiro[~financeiro["Vencida"]]
+    por_cliente = financeiro.groupby("Cliente")["Valor"].sum().sort_values(ascending=False)
+    metricas = dict(vazio)
+    metricas.update({
+        "total_aberto": total,
+        "total_vencido": vencido,
+        "percentual_vencido": (vencido / total * 100) if total else 0.0,
+        "vence_7": float(futuro.loc[futuro["Dias_para_vencer"].between(0, 7), "Valor"].sum()),
+        "vence_15": float(futuro.loc[futuro["Dias_para_vencer"].between(8, 15), "Valor"].sum()),
+        "vence_30": float(futuro.loc[futuro["Dias_para_vencer"].between(16, 30), "Valor"].sum()),
+        "prazo_medio": float(
+            (futuro["Dias_para_vencer"] * futuro["Valor"]).sum() /
+            futuro["Valor"].sum()
+        ) if futuro["Valor"].sum() else 0.0,
+        "concentracao_top5": (
+            float(por_cliente.head(5).sum()) / total * 100
+        ) if total else 0.0,
+        "clientes_devedores": int(
+            financeiro.loc[financeiro["Vencida"], "Cliente"].nunique()
+        ),
+    })
+    return metricas
+
 def processar_dataframes(vendas, orc, contas):
     hoje = datetime.now()
 
@@ -456,6 +581,9 @@ def processar_dataframes(vendas, orc, contas):
     contas[cc_valor] = numero_coluna(contas[cc_valor])
     if cc_venc:
         contas[cc_venc] = data_coluna(contas[cc_venc])
+    financeiro = preparar_financeiro(
+        contas, cc_cli, cc_venc, cc_valor, cc_status
+    )
 
     clientes = vendas.groupby(cv_cli).agg({
         cv_data: ["max", "count"],
@@ -552,6 +680,7 @@ def processar_dataframes(vendas, orc, contas):
         "co_cli": co_cli,
         "co_data": co_data,
         "co_valor": co_valor,
+        "financeiro": financeiro,
         "periodo_inicio": vendas[cv_data].min(),
         "periodo_fim": vendas[cv_data].max(),
     }
@@ -606,7 +735,12 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
             item.get("data_vencimento"), format="%Y-%m-%d", errors="coerce"
         ),
         "Valor Total": item.get("valor_total") or item.get("valor") or 0,
-        "Situacao": "ATRASADO",
+        "Situacao": item.get("_status_financeiro") or "EM ABERTO",
+        "Juros": item.get("juros") or 0,
+        "Desconto": item.get("desconto") or 0,
+        "Forma Pagamento": item.get("nome_forma_pagamento") or "",
+        "Loja": item.get("nome_loja") or "",
+        "_recebimento_id": item.get("id"),
     } for item in recebimentos_api])
 
     if vendas.empty:
@@ -617,13 +751,16 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
             "_orcamento_id", "_observacoes_interna"
         ])
     if contas.empty:
-        contas = pd.DataFrame(columns=["Cliente", "Vencimento", "Valor Total", "Situacao"])
+        contas = pd.DataFrame(columns=[
+            "Cliente", "Vencimento", "Valor Total", "Situacao", "Juros",
+            "Desconto", "Forma Pagamento", "Loja", "_recebimento_id"
+        ])
     return vendas, orcamentos, contas
 
 def processar_api(api, inicio, fim, loja_id, vendedor_id=None, vendedor_nome="Todos"):
     vendas_api = api.sales(inicio, fim, loja_id)
     orcamentos_api = api.budgets(max(inicio, fim - timedelta(days=30)), fim, loja_id)
-    recebimentos_api = api.overdue_receivables(fim, loja_id)
+    recebimentos_api = api.open_receivables(loja_id)
     vendas, orcamentos, contas = api_para_dataframes(
         vendas_api, orcamentos_api, recebimentos_api, vendedor_id
     )
@@ -718,7 +855,8 @@ Recomendação: <b>{acao_html}</b>
 
 def gerar_texto_email(
     prioridade, orc_aberto, clientes, clientes_churn,
-    co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+    co_num, co_cli, co_valor, periodo_inicio, periodo_fim,
+    financeiro=None
 ):
     hoje_txt = datetime.now().strftime("%d/%m/%Y")
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
@@ -727,6 +865,7 @@ def gerar_texto_email(
         "dias_no_sistema", ascending=False
     )
     temperaturas = clientes["temperatura"].value_counts()
+    metricas_fin = calcular_metricas_financeiras(financeiro)
 
     linhas = [
         f"RESUMO COMERCIAL DIÁRIO - {hoje_txt}",
@@ -739,6 +878,14 @@ def gerar_texto_email(
         f"- Potencial recuperável: {fmt(clientes['potencial_recuperavel'].sum())}",
         f"- Inadimplência identificada: {fmt(clientes['inadimplencia'].sum())}",
         f"- Churn estimado: {taxa_churn:.1f}% ({qtd_churn} de {base_churn} clientes com ciclo conhecido)",
+        "",
+        "FINANCEIRO",
+        f"- Carteira a receber: {fmt(metricas_fin['total_aberto'])}",
+        f"- Total vencido: {fmt(metricas_fin['total_vencido'])} ({metricas_fin['percentual_vencido']:.1f}%)",
+        f"- Entradas previstas em até 7 dias: {fmt(metricas_fin['vence_7'])}",
+        f"- Entradas previstas de 8 a 15 dias: {fmt(metricas_fin['vence_15'])}",
+        f"- Entradas previstas de 16 a 30 dias: {fmt(metricas_fin['vence_30'])}",
+        f"- Concentração nos 5 maiores clientes: {metricas_fin['concentracao_top5']:.1f}%",
         "",
         "CARTEIRA",
         f"- Quentes: {int(temperaturas.get('🟢 QUENTE', 0))}",
@@ -792,7 +939,8 @@ def gerar_texto_email(
 
 def gerar_pdf(
     prioridade, orc_aberto, clientes, clientes_churn,
-    co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+    co_num, co_cli, co_valor, periodo_inicio, periodo_fim,
+    financeiro=None
 ):
     if not REPORTLAB_OK:
         return None
@@ -802,6 +950,7 @@ def gerar_pdf(
     orc_urgentes = orc_aberto[orc_aberto["dias_no_sistema"] >= 2].sort_values(
         "dias_no_sistema", ascending=False
     )
+    metricas_fin = calcular_metricas_financeiras(financeiro)
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -873,6 +1022,9 @@ def gerar_pdf(
         [p("Capacidade das prioridades"), p(fmt(prioridade["ticket_medio"].sum())), p("Soma dos tickets médios; não é previsão garantida.")],
         [p("Potencial recuperável"), p(fmt(clientes["potencial_recuperavel"].sum())), p("Potencial de atrasados e inativos.")],
         [p("Inadimplência"), p(fmt(clientes["inadimplencia"].sum())), p("Pendências identificadas no contas a receber.")],
+        [p("Carteira a receber"), p(fmt(metricas_fin["total_aberto"])), p("Total de recebimentos ainda em aberto.")],
+        [p("Percentual vencido"), p(f"{metricas_fin['percentual_vencido']:.1f}%"), p("Participação dos títulos vencidos na carteira aberta.")],
+        [p("Receber em até 7 dias"), p(fmt(metricas_fin["vence_7"])), p("Entradas previstas no curto prazo.")],
         [p("Churn estimado"), p(f"{taxa_churn:.1f}%"), p(f"{qtd_churn} de {base_churn} clientes com ciclo conhecido.")],
     ]
     elementos.append(Paragraph("1. Painel executivo", styles["SecaoCEO"]))
@@ -949,7 +1101,27 @@ def gerar_pdf(
     else:
         elementos.append(tabela(inad_pdf, [55 * mm, 32 * mm, 32 * mm, 41 * mm]))
 
-    elementos.append(Paragraph("7. Plano de ação", styles["SecaoCEO"]))
+    elementos.append(Paragraph("7. Carteira financeira", styles["SecaoCEO"]))
+    if financeiro is None or financeiro.empty:
+        elementos.append(Paragraph("Nenhum recebimento em aberto identificado.", styles["Normal"]))
+    else:
+        fin_clientes = (
+            financeiro.groupby("Cliente")["Valor"].sum()
+            .sort_values(ascending=False)
+            .head(15)
+        )
+        fin_pdf = [[p("Cliente"), p("Total a receber"), p("% da carteira")]]
+        for cliente, valor in fin_clientes.items():
+            participacao = (
+                float(valor) / metricas_fin["total_aberto"] * 100
+                if metricas_fin["total_aberto"] else 0
+            )
+            fin_pdf.append([
+                p(cliente), p(fmt(valor)), p(f"{participacao:.1f}%")
+            ])
+        elementos.append(tabela(fin_pdf, [80 * mm, 42 * mm, 38 * mm]))
+
+    elementos.append(Paragraph("8. Plano de ação", styles["SecaoCEO"]))
     elementos.append(Paragraph(
         f"<b>Hoje:</b> realizar {len(prioridade)} contatos prioritários e retornar "
         f"{len(orc_urgentes)} orçamentos urgentes.<br/>"
@@ -959,13 +1131,15 @@ def gerar_pdf(
         styles["BodyText"]
     ))
 
-    elementos.append(Paragraph("8. Metodologia", styles["SecaoCEO"]))
+    elementos.append(Paragraph("9. Metodologia", styles["SecaoCEO"]))
     elementos.append(Paragraph(
         "<b>Churn estimado:</b> clientes com ciclo conhecido e mais de duas vezes o intervalo "
         "médio sem comprar, dividido pela quantidade de clientes com ciclo conhecido.<br/>"
         "<b>Potencial mensal:</b> compras dos últimos três meses divididas por três.<br/>"
         "<b>Capacidade das prioridades:</b> soma dos tickets médios dos clientes quentes; "
         "não representa promessa de venda.<br/>"
+        "<b>Percentual vencido:</b> valor vencido dividido pela carteira total ainda em aberto.<br/>"
+        "<b>Concentração:</b> participação dos cinco maiores clientes no total a receber.<br/>"
         "<b>Cliente estratégico:</b> cliente situado entre os 10% de maior faturamento histórico.",
         styles["BodyText"]
     ))
@@ -983,6 +1157,150 @@ def gerar_pdf(
     buffer.close()
     return pdf
 
+def renderizar_financeiro_ceo(financeiro, clientes, clientes_churn):
+    st.subheader("Financeiro CEO")
+    st.caption(
+        "Visão estratégica da carteira de recebimentos em aberto. "
+        "Os valores representam entradas previstas, não saldo bancário disponível."
+    )
+    metricas = calcular_metricas_financeiras(financeiro)
+
+    linha1 = st.columns(4)
+    linha1[0].metric("Carteira a receber", fmt(metricas["total_aberto"]))
+    linha1[1].metric(
+        "Total vencido",
+        fmt(metricas["total_vencido"]),
+        f"{metricas['percentual_vencido']:.1f}% da carteira"
+    )
+    linha1[2].metric("Receber em até 7 dias", fmt(metricas["vence_7"]))
+    linha1[3].metric("Clientes devedores", metricas["clientes_devedores"])
+
+    linha2 = st.columns(4)
+    linha2[0].metric("Receber de 8 a 15 dias", fmt(metricas["vence_15"]))
+    linha2[1].metric("Receber de 16 a 30 dias", fmt(metricas["vence_30"]))
+    linha2[2].metric("Prazo médio a receber", f"{metricas['prazo_medio']:.0f} dias")
+    linha2[3].metric("Concentração nos 5 maiores", f"{metricas['concentracao_top5']:.1f}%")
+
+    if financeiro is None or financeiro.empty:
+        st.info("Nenhuma conta em aberto foi encontrada para montar a visão financeira.")
+        return
+
+    potencial_churn = float(clientes_churn["potencial_mensal"].sum())
+    receita_em_risco = metricas["total_vencido"] + potencial_churn
+    st.metric(
+        "Exposição estratégica estimada",
+        fmt(receita_em_risco),
+        help=(
+            "Soma do valor vencido com o potencial mensal dos clientes em churn. "
+            "É um indicador de exposição, não uma perda contábil confirmada."
+        )
+    )
+
+    st.markdown("#### Alertas estratégicos")
+    alertas = []
+    if metricas["percentual_vencido"] >= 25:
+        alertas.append(
+            f"CRÍTICO: {metricas['percentual_vencido']:.1f}% da carteira está vencida."
+        )
+    elif metricas["percentual_vencido"] >= 10:
+        alertas.append(
+            f"ATENÇÃO: {metricas['percentual_vencido']:.1f}% da carteira está vencida."
+        )
+    if metricas["concentracao_top5"] >= 50:
+        alertas.append(
+            "A carteira está concentrada: os cinco maiores clientes representam "
+            f"{metricas['concentracao_top5']:.1f}% do total a receber."
+        )
+    vencido_60 = float(financeiro.loc[
+        financeiro["Dias_atraso"] > 60, "Valor"
+    ].sum())
+    if vencido_60 > 0:
+        alertas.append(
+            f"Existem {fmt(vencido_60)} vencidos há mais de 60 dias."
+        )
+    if metricas["vence_7"] > 0:
+        alertas.append(
+            f"Há {fmt(metricas['vence_7'])} previstos para entrar nos próximos 7 dias."
+        )
+    if not alertas:
+        st.success("Nenhum alerta financeiro relevante pelos critérios atuais.")
+    else:
+        for alerta in alertas:
+            st.warning(alerta)
+
+    col_aging, col_fluxo = st.columns(2)
+    ordem_faixas = [
+        "Vencido acima de 60 dias",
+        "Vencido de 31 a 60 dias",
+        "Vencido de 16 a 30 dias",
+        "Vencido de 8 a 15 dias",
+        "Vencido até 7 dias",
+        "A vencer em até 7 dias",
+        "A vencer de 8 a 15 dias",
+        "A vencer de 16 a 30 dias",
+        "A vencer de 31 a 60 dias",
+        "A vencer acima de 60 dias",
+    ]
+    with col_aging:
+        st.markdown("#### Carteira por faixa de vencimento")
+        aging = (
+            financeiro.groupby("Faixa")["Valor"].sum()
+            .reindex(ordem_faixas, fill_value=0)
+        )
+        st.bar_chart(aging)
+
+    with col_fluxo:
+        st.markdown("#### Entradas previstas por mês")
+        futuro = financeiro[~financeiro["Vencida"]].copy()
+        if futuro.empty:
+            st.info("Não há recebimentos futuros na carteira consultada.")
+        else:
+            futuro["Mês"] = futuro["Vencimento"].dt.strftime("%m/%Y")
+            fluxo = futuro.groupby("Mês", sort=False)["Valor"].sum()
+            st.bar_chart(fluxo)
+
+    st.markdown("#### Maiores clientes na carteira")
+    ranking = (
+        financeiro.groupby("Cliente")
+        .agg(
+            Total=("Valor", "sum"),
+            Vencido=("Valor", lambda s: s[financeiro.loc[s.index, "Vencida"]].sum()),
+            Titulos=("Valor", "count"),
+            Maior_atraso=("Dias_atraso", "max"),
+        )
+        .sort_values("Total", ascending=False)
+        .head(20)
+        .reset_index()
+    )
+    ranking["Total"] = ranking["Total"].map(fmt)
+    ranking["Vencido"] = ranking["Vencido"].map(fmt)
+    ranking = ranking.rename(columns={
+        "Titulos": "Títulos",
+        "Maior_atraso": "Maior atraso (dias)"
+    })
+    st.dataframe(ranking, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Clientes ativos com pendências")
+    ativos_inadimplentes = clientes[
+        clientes["inadimplencia"] > 0
+    ].sort_values("inadimplencia", ascending=False).copy()
+    if ativos_inadimplentes.empty:
+        st.success("Nenhum cliente da carteira comercial possui pendência identificada.")
+    else:
+        tabela_ativos = ativos_inadimplentes[[
+            "Cliente", "ultima_compra", "inadimplencia",
+            "media_dias_atraso", "temperatura"
+        ]].head(20).copy()
+        tabela_ativos["ultima_compra"] = tabela_ativos["ultima_compra"].dt.strftime("%d/%m/%Y")
+        tabela_ativos["inadimplencia"] = tabela_ativos["inadimplencia"].map(fmt)
+        tabela_ativos = tabela_ativos.rename(columns={
+            "ultima_compra": "Última compra",
+            "inadimplencia": "Valor vencido",
+            "media_dias_atraso": "Média de atraso",
+            "temperatura": "Situação comercial",
+        })
+        st.dataframe(tabela_ativos, use_container_width=True, hide_index=True)
+
 def renderizar():
     dados = st.session_state.dados_processados
     clientes = dados["clientes"]
@@ -992,6 +1310,7 @@ def renderizar():
     co_valor = dados["co_valor"]
     periodo_inicio = dados.get("periodo_inicio", clientes["ultima_compra"].min())
     periodo_fim = dados.get("periodo_fim", clientes["ultima_compra"].max())
+    financeiro = dados.get("financeiro", pd.DataFrame())
 
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
@@ -1009,8 +1328,8 @@ def renderizar():
     else:
         st.info("Dados carregados por arquivos Excel.")
 
-    aba_ceo, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
-        "👑 CEO", "📉 Churn", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
+    aba_ceo, aba_financeiro, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
+        "👑 CEO", "💰 Financeiro CEO", "📉 Churn", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
 
     with aba_ceo:
@@ -1056,6 +1375,9 @@ def renderizar():
         st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
         st.caption("Soma do potencial mensal dos clientes classificados como ATRASADO NA RECOMPRA ou CLIENTE INATIVO.")
         st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
+
+    with aba_financeiro:
+        renderizar_financeiro_ceo(financeiro, clientes, clientes_churn)
 
     with aba_churn:
         st.subheader("📉 Clientes em churn")
@@ -1244,7 +1566,8 @@ Recomendação: <b>{acao_html}</b>
         )
         texto_email = gerar_texto_email(
             prioridade, orc_aberto, clientes, clientes_churn,
-            co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+            co_num, co_cli, co_valor, periodo_inicio, periodo_fim,
+            financeiro
         )
         st.text_area("Texto pronto para enviar:", texto_email, height=650)
         st.download_button(
@@ -1262,7 +1585,8 @@ Recomendação: <b>{acao_html}</b>
         )
         pdf = gerar_pdf(
             prioridade, orc_aberto, clientes, clientes_churn,
-            co_num, co_cli, co_valor, periodo_inicio, periodo_fim
+            co_num, co_cli, co_valor, periodo_inicio, periodo_fim,
+            financeiro
         )
         if pdf:
             st.download_button(
