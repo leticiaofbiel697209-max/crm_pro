@@ -1994,7 +1994,11 @@ def renderizar_financeiro_real(dados):
     st.markdown("---")
     st.subheader("Resultado econômico e cenários")
     if not real:
-        st.info("Não há vendas suficientes para calcular o resultado econômico.")
+        st.info(
+            "Os dados desta sessão foram carregados por uma versão anterior. "
+            "Clique em 'Atualizar dados do GestãoClick' para calcular custos, "
+            "margens e resultado econômico."
+        )
         return
     cols = st.columns(4)
     cols[0].metric("Receita do mês", fmt(real["receita_mes"]))
@@ -2035,7 +2039,11 @@ def renderizar_gestao_comercial(dados):
     )
     st.subheader("Gestão Comercial")
     if not indicadores:
-        st.info("Não há dados comerciais suficientes.")
+        st.info(
+            "Os dados desta sessão foram carregados por uma versão anterior. "
+            "Clique em 'Atualizar dados do GestãoClick' para calcular metas, "
+            "margens e desempenho por vendedor."
+        )
         return
     cols = st.columns(4)
     cols[0].metric("Meta geral", fmt(indicadores["meta_geral"]))
@@ -2086,6 +2094,7 @@ def renderizar_gestao_comercial(dados):
 
 def renderizar_qualidade_dados(dados):
     qualidade = dados.get("qualidade_dados", {})
+    clientes = dados.get("clientes", pd.DataFrame()).copy()
     st.subheader("Qualidade dos Dados")
     cols = st.columns(5)
     cols[0].metric("Vendas excluídas", qualidade.get("vendas_canceladas", 0))
@@ -2114,6 +2123,11 @@ def renderizar_qualidade_dados(dados):
     )
 
     st.markdown("#### Clientes ativos com pendências")
+    if clientes.empty or "inadimplencia" not in clientes.columns:
+        st.info(
+            "Atualize os dados do GestãoClick para analisar clientes com pendências."
+        )
+        return
     ativos_inadimplentes = clientes[
         clientes["inadimplencia"] > 0
     ].sort_values("inadimplencia", ascending=False).copy()
@@ -2164,6 +2178,7 @@ def renderizar():
         st.success(
             f"Dados carregados pela API do GestãoClick | "
             f"Vendedor: {dados.get('vendedor_nome', 'Todos')} | "
+            f"Período: {periodo_inicio:%d/%m/%Y} a {periodo_fim:%d/%m/%Y} | "
             f"Atualizado em {texto_atualizacao}"
         )
     else:
