@@ -1,9 +1,14 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from html import escape
+import json
 import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -29,9 +34,154 @@ if "clientes_ligados" not in st.session_state:
     st.session_state.clientes_ligados = set()
 if "observacoes_orc" not in st.session_state:
     st.session_state.observacoes_orc = {}
+if "gestaoclick_lojas" not in st.session_state:
+    st.session_state.gestaoclick_lojas = []
+if "gestaoclick_usuarios" not in st.session_state:
+    st.session_state.gestaoclick_usuarios = []
 
 NOME_PLANILHA = "CRM_HISTORICO_LUKATONER"
 USUARIO_PADRAO = "Gabriel"
+API_BASE = "https://api.gestaoclick.com"
+
+class GestaoClickAPI:
+    def __init__(self, access_token, secret_token):
+        self.headers = {
+            "Content-Type": "application/json",
+            "access-token": access_token,
+            "secret-access-token": secret_token,
+        }
+        self.last_request = 0.0
+
+    def request(self, path, params=None, method="GET", body=None):
+        elapsed = time.monotonic() - self.last_request
+        if elapsed < 0.36:
+            time.sleep(0.36 - elapsed)
+
+        url = API_BASE + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(
+            url, data=data, headers=self.headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"GestãoClick retornou erro {exc.code}: {detail}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Não foi possível acessar o GestãoClick: {exc.reason}"
+            ) from exc
+        finally:
+            self.last_request = time.monotonic()
+
+        if payload.get("status") != "success":
+            raise RuntimeError(
+                payload.get("message") or "Resposta inesperada do GestãoClick."
+            )
+        return payload
+
+    def list_all(self, path, params=None):
+        records = []
+        page = 1
+        while True:
+            query = dict(params or {})
+            query.update({"pagina": page, "limite": 100})
+            payload = self.request(path, query)
+            page_records = payload.get("data") or []
+            records.extend(page_records)
+            meta = payload.get("meta") or {}
+            if not meta.get("proxima_pagina") and len(page_records) < 100:
+                break
+            page += 1
+            if page > 200:
+                raise RuntimeError("A consulta excedeu 200 páginas.")
+        return records
+
+    def stores(self):
+        return self.list_all("/lojas")
+
+    def users(self, store_id):
+        return self.list_all("/usuarios", {"loja_id": store_id})
+
+    def sales(self, start_date, end_date, store_id):
+        return self.list_all("/vendas", {
+            "loja_id": store_id,
+            "data_inicio": start_date.isoformat(),
+            "data_fim": end_date.isoformat(),
+        })
+
+    def budgets(self, start_date, end_date, store_id):
+        return self.list_all("/orcamentos", {
+            "loja_id": store_id,
+            "data_inicio": start_date.isoformat(),
+            "data_fim": end_date.isoformat(),
+        })
+
+    def overdue_receivables(self, end_date, store_id):
+        return self.list_all("/recebimentos", {
+            "loja_id": store_id,
+            "data_fim": end_date.isoformat(),
+            "liquidado": "at",
+        })
+
+    def budget(self, budget_id, store_id):
+        return self.request(
+            f"/orcamentos/{budget_id}", {"loja_id": store_id}
+        ).get("data") or {}
+
+    @staticmethod
+    def prepare_budget(budget):
+        budget["tipo"] = (
+            "servico"
+            if budget.get("servicos") and not budget.get("produtos")
+            else "produto"
+        )
+        for wrapper in budget.get("produtos") or []:
+            product = wrapper.get("produto") or {}
+            if not product.get("id") and product.get("produto_id"):
+                product["id"] = product["produto_id"]
+        return budget
+
+    def append_budget_note(self, budget_id, store_id, note, user):
+        budget = self.budget(budget_id, store_id)
+        if not budget:
+            raise RuntimeError("O orçamento não foi encontrado no GestãoClick.")
+
+        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
+        entry = f"[CRM {timestamp}] {user} | {note.strip()}"
+        previous = str(budget.get("observacoes_interna") or "").strip()
+        budget["observacoes_interna"] = f"{previous}\n{entry}".strip()
+        budget = self.prepare_budget(budget)
+        return self.request(
+            f"/orcamentos/{budget_id}",
+            {"loja_id": store_id},
+            method="PUT",
+            body=budget,
+        ).get("data") or {}
+
+def credenciais_gestaoclick():
+    try:
+        config = st.secrets.get("gestaoclick", {})
+        access = str(config.get("access_token", "")).strip()
+        secret = str(config.get("secret_token", "")).strip()
+    except Exception:
+        access = ""
+        secret = ""
+
+    access = str(st.session_state.get("gc_access_token", access)).strip()
+    secret = str(st.session_state.get("gc_secret_token", secret)).strip()
+    return access, secret
+
+def api_gestaoclick():
+    access, secret = credenciais_gestaoclick()
+    if not access or not secret:
+        raise RuntimeError("Informe os dois tokens da API do GestãoClick.")
+    return GestaoClickAPI(access, secret)
 
 def fmt(v):
     try:
@@ -262,12 +412,8 @@ def score_comercial(row):
         score += 20
     return min(score, 100)
 
-def processar_dados(vendas_file, orc_file, contas_file):
+def processar_dataframes(vendas, orc, contas):
     hoje = datetime.now()
-
-    vendas = carregar_excel(vendas_file, [["cliente"], ["data"], ["valor"]])
-    orc = carregar_excel(orc_file, [["nº", "n°", "numero", "número"], ["cliente"], ["data"], ["situação", "status"]])
-    contas = carregar_excel(contas_file, [["cliente", "destinado"], ["vencimento"], ["valor"], ["situação", "status"]])
 
     cv_cli = achar_coluna(vendas, ["cliente"])
     cv_data = achar_coluna(vendas, ["data"])
@@ -409,6 +555,90 @@ def processar_dados(vendas_file, orc_file, contas_file):
         "periodo_inicio": vendas[cv_data].min(),
         "periodo_fim": vendas[cv_data].max(),
     }
+
+def processar_dados(vendas_file, orc_file, contas_file):
+    vendas = carregar_excel(vendas_file, [["cliente"], ["data"], ["valor"]])
+    orc = carregar_excel(
+        orc_file,
+        [["nº", "n°", "numero", "número"], ["cliente"], ["data"], ["situação", "status"]]
+    )
+    contas = carregar_excel(
+        contas_file,
+        [["cliente", "destinado"], ["vencimento"], ["valor"], ["situação", "status"]]
+    )
+    dados = processar_dataframes(vendas, orc, contas)
+    dados["origem"] = "excel"
+    return dados
+
+def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_id=None):
+    if vendedor_id:
+        vendas_api = [
+            item for item in vendas_api
+            if str(item.get("vendedor_id") or "") == str(vendedor_id)
+        ]
+        orcamentos_api = [
+            item for item in orcamentos_api
+            if str(item.get("vendedor_id") or "") == str(vendedor_id)
+        ]
+
+    vendas = pd.DataFrame([{
+        "Cliente": item.get("nome_cliente") or "Cliente sem nome",
+        "Data": pd.to_datetime(item.get("data"), format="%Y-%m-%d", errors="coerce"),
+        "Valor": item.get("valor_total") or 0,
+        "Vendedor": item.get("nome_vendedor") or "Sem vendedor",
+        "Vendedor ID": item.get("vendedor_id"),
+    } for item in vendas_api])
+
+    orcamentos = pd.DataFrame([{
+        "Numero": item.get("codigo") or item.get("id"),
+        "Cliente": item.get("nome_cliente") or "Cliente sem nome",
+        "Data": pd.to_datetime(item.get("data"), format="%Y-%m-%d", errors="coerce"),
+        "Situacao": item.get("nome_situacao") or "",
+        "Valor": item.get("valor_total") or 0,
+        "Vendedor": item.get("nome_vendedor") or "Sem vendedor",
+        "_orcamento_id": item.get("id"),
+        "_observacoes_interna": item.get("observacoes_interna") or "",
+    } for item in orcamentos_api])
+
+    contas = pd.DataFrame([{
+        "Cliente": item.get("nome_cliente") or "Cliente sem nome",
+        "Vencimento": pd.to_datetime(
+            item.get("data_vencimento"), format="%Y-%m-%d", errors="coerce"
+        ),
+        "Valor Total": item.get("valor_total") or item.get("valor") or 0,
+        "Situacao": "ATRASADO",
+    } for item in recebimentos_api])
+
+    if vendas.empty:
+        vendas = pd.DataFrame(columns=["Cliente", "Data", "Valor", "Vendedor", "Vendedor ID"])
+    if orcamentos.empty:
+        orcamentos = pd.DataFrame(columns=[
+            "Numero", "Cliente", "Data", "Situacao", "Valor", "Vendedor",
+            "_orcamento_id", "_observacoes_interna"
+        ])
+    if contas.empty:
+        contas = pd.DataFrame(columns=["Cliente", "Vencimento", "Valor Total", "Situacao"])
+    return vendas, orcamentos, contas
+
+def processar_api(api, inicio, fim, loja_id, vendedor_id=None, vendedor_nome="Todos"):
+    vendas_api = api.sales(inicio, fim, loja_id)
+    orcamentos_api = api.budgets(max(inicio, fim - timedelta(days=30)), fim, loja_id)
+    recebimentos_api = api.overdue_receivables(fim, loja_id)
+    vendas, orcamentos, contas = api_para_dataframes(
+        vendas_api, orcamentos_api, recebimentos_api, vendedor_id
+    )
+    if vendas.empty:
+        raise RuntimeError("Nenhuma venda foi encontrada para os filtros selecionados.")
+
+    dados = processar_dataframes(vendas, orcamentos, contas)
+    dados.update({
+        "origem": "api",
+        "loja_id": str(loja_id),
+        "vendedor_id": str(vendedor_id or ""),
+        "vendedor_nome": vendedor_nome,
+        "atualizado_em": datetime.now(),
+    })
+    return dados
 
 def montar_prioridade(clientes):
     return clientes[
@@ -768,6 +998,17 @@ def renderizar():
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
     clientes_churn = listar_clientes_churn(clientes)
 
+    if dados.get("origem") == "api":
+        atualizado = dados.get("atualizado_em")
+        texto_atualizacao = atualizado.strftime("%d/%m/%Y %H:%M") if atualizado else "agora"
+        st.success(
+            f"Dados carregados pela API do GestãoClick | "
+            f"Vendedor: {dados.get('vendedor_nome', 'Todos')} | "
+            f"Atualizado em {texto_atualizacao}"
+        )
+    else:
+        st.info("Dados carregados por arquivos Excel.")
+
     aba_ceo, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_base, aba_email, aba_relatorio = st.tabs([
         "👑 CEO", "📉 Churn", "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
@@ -902,16 +1143,40 @@ Valor: <b>{valor_txt}</b>
 </div>
 """, unsafe_allow_html=True)
 
+                        if dados.get("origem") == "api" and str(r.get("_observacoes_interna", "")).strip():
+                            with st.expander("Ver histórico do GestãoClick"):
+                                st.text(str(r.get("_observacoes_interna", "")))
+
                         obs = st.text_area(
-                            "Observação",
+                            "Nova observação" if dados.get("origem") == "api" else "Observação",
                             value=st.session_state.observacoes_orc.get(num_orc, ""),
                             key=chave_obs
                         )
 
                         if st.button(f"💾 Salvar observação {num_orc}", key=f"salvar_obs_{num_orc}"):
-                            st.session_state.observacoes_orc[num_orc] = obs
-                            salvar_observacao_orcamento(num_orc, r[co_cli], obs)
-                            st.success("Observação salva.")
+                            try:
+                                if not obs.strip():
+                                    raise RuntimeError("Digite uma observação antes de salvar.")
+                                if dados.get("origem") == "api":
+                                    orcamento_id = str(r.get("_orcamento_id") or "").strip()
+                                    if not orcamento_id:
+                                        raise RuntimeError("ID interno do orçamento não encontrado.")
+                                    api_gestaoclick().append_budget_note(
+                                        orcamento_id,
+                                        dados["loja_id"],
+                                        obs,
+                                        st.session_state.get(
+                                            "gc_usuario_nome", USUARIO_PADRAO
+                                        )
+                                    )
+                                    st.session_state.observacoes_orc[num_orc] = obs
+                                    st.success("Observação gravada diretamente no GestãoClick.")
+                                else:
+                                    st.session_state.observacoes_orc[num_orc] = obs
+                                    salvar_observacao_orcamento(num_orc, r[co_cli], obs)
+                                    st.success("Observação salva no Google Sheets.")
+                            except Exception as e:
+                                st.error(f"Não foi possível salvar a observação: {e}")
 
     with aba_gestao:
         st.subheader("🧠 Gestão")
@@ -1009,36 +1274,146 @@ Recomendação: <b>{acao_html}</b>
         else:
             st.warning("PDF indisponível. Verifique se 'reportlab' está no requirements.txt.")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Google Sheets")
+st.sidebar.header("Fonte dos dados")
+modo_dados = st.sidebar.radio(
+    "Como deseja carregar?",
+    ["API GestãoClick", "Excel (contingência)"]
+)
 
-if st.sidebar.button("Testar conexão Sheets"):
-    try:
-        planilha = conectar_google_sheets()
-        abas = [aba.title for aba in planilha.worksheets()]
-        st.sidebar.success("Conexão OK")
-        st.sidebar.write(abas)
-    except Exception as e:
-        st.sidebar.error(f"Erro: {e}")
+if modo_dados == "API GestãoClick":
+    st.sidebar.subheader("Conexão GestãoClick")
+    access_padrao, secret_padrao = credenciais_gestaoclick()
+    if "gc_access_token" not in st.session_state:
+        st.session_state.gc_access_token = access_padrao
+    if "gc_secret_token" not in st.session_state:
+        st.session_state.gc_secret_token = secret_padrao
+    if "gc_usuario_nome" not in st.session_state:
+        st.session_state.gc_usuario_nome = USUARIO_PADRAO
 
-st.sidebar.header("Importar Dados")
-vendas_file = st.sidebar.file_uploader("Relatório de Vendas", type=["xlsx"])
-orc_file = st.sidebar.file_uploader("Relatório de Orçamentos", type=["xlsx"])
-contas_file = st.sidebar.file_uploader("Contas a Receber", type=["xlsx"])
+    st.sidebar.text_input(
+        "Access token",
+        key="gc_access_token",
+        type="password"
+    )
+    st.sidebar.text_input(
+        "Secret access token",
+        key="gc_secret_token",
+        type="password"
+    )
+    st.sidebar.caption(
+        "Em produção, salve os tokens em st.secrets['gestaoclick']."
+    )
+    st.sidebar.text_input(
+        "Nome de quem registra as observações",
+        key="gc_usuario_nome"
+    )
 
-if st.sidebar.button("Analisar Dados"):
-    if not vendas_file or not orc_file or not contas_file:
-        st.error("Envie os três arquivos.")
-        st.stop()
+    if st.sidebar.button("Conectar e carregar lojas"):
+        try:
+            with st.spinner("Conectando ao GestãoClick..."):
+                st.session_state.gestaoclick_lojas = api_gestaoclick().stores()
+                st.session_state.gestaoclick_usuarios = []
+            st.sidebar.success("Conexão realizada.")
+        except Exception as e:
+            st.sidebar.error(f"Erro de conexão: {e}")
 
-    try:
-        st.session_state.clientes_ligados = carregar_clientes_ligados_hoje()
-        st.session_state.observacoes_orc = carregar_observacoes_orcamentos()
-        st.session_state.dados_processados = processar_dados(vendas_file, orc_file, contas_file)
-    except Exception as e:
-        st.error(f"Erro ao processar: {e}")
+    lojas = st.session_state.gestaoclick_lojas
+    if lojas:
+        lojas_validas = [
+            loja for loja in lojas
+            if str(loja.get("id") or "").strip()
+        ]
+        loja_escolhida = st.sidebar.selectbox(
+            "Loja",
+            lojas_validas,
+            format_func=lambda loja: (
+                loja.get("nome") or loja.get("nome_fantasia") or f"Loja {loja.get('id')}"
+            )
+        )
+        loja_id = str(loja_escolhida.get("id"))
+
+        if st.sidebar.button("Carregar vendedores"):
+            try:
+                with st.spinner("Carregando vendedores..."):
+                    st.session_state.gestaoclick_usuarios = api_gestaoclick().users(loja_id)
+                st.sidebar.success("Vendedores carregados.")
+            except Exception as e:
+                st.sidebar.error(f"Erro ao carregar vendedores: {e}")
+
+        usuarios = [
+            usuario for usuario in st.session_state.gestaoclick_usuarios
+            if str(usuario.get("id") or "").strip()
+            and str(usuario.get("nome") or "").strip()
+        ]
+        opcoes_vendedor = [{"id": "", "nome": "Todos"}, *usuarios]
+        vendedor = st.sidebar.selectbox(
+            "Vendedor",
+            opcoes_vendedor,
+            format_func=lambda item: item.get("nome") or "Sem nome"
+        )
+
+        fim_padrao = date.today()
+        inicio_padrao = fim_padrao - timedelta(days=365)
+        inicio_api = st.sidebar.date_input(
+            "Vendas desde",
+            value=inicio_padrao,
+            max_value=fim_padrao
+        )
+        fim_api = st.sidebar.date_input(
+            "Até",
+            value=fim_padrao,
+            min_value=inicio_api,
+            max_value=fim_padrao
+        )
+        st.sidebar.caption(
+            "Para churn, recomenda-se analisar pelo menos 12 meses de vendas."
+        )
+
+        if st.sidebar.button("Atualizar dados do GestãoClick", type="primary"):
+            try:
+                with st.spinner(
+                    "Buscando vendas, orçamentos e contas a receber..."
+                ):
+                    st.session_state.clientes_ligados = carregar_clientes_ligados_hoje()
+                    st.session_state.observacoes_orc = {}
+                    st.session_state.dados_processados = processar_api(
+                        api_gestaoclick(),
+                        inicio_api,
+                        fim_api,
+                        loja_id,
+                        vendedor.get("id") or None,
+                        vendedor.get("nome") or "Todos"
+                    )
+                st.success("Dados atualizados pelo GestãoClick.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao buscar dados do GestãoClick: {e}")
+    else:
+        st.sidebar.info("Conecte a API para selecionar uma loja.")
+
+else:
+    st.sidebar.header("Importar arquivos")
+    vendas_file = st.sidebar.file_uploader("Relatório de Vendas", type=["xlsx"])
+    orc_file = st.sidebar.file_uploader("Relatório de Orçamentos", type=["xlsx"])
+    contas_file = st.sidebar.file_uploader("Contas a Receber", type=["xlsx"])
+
+    if st.sidebar.button("Analisar arquivos", type="primary"):
+        if not vendas_file or not orc_file or not contas_file:
+            st.error("Envie os três arquivos.")
+            st.stop()
+
+        try:
+            st.session_state.clientes_ligados = carregar_clientes_ligados_hoje()
+            st.session_state.observacoes_orc = carregar_observacoes_orcamentos()
+            st.session_state.dados_processados = processar_dados(
+                vendas_file, orc_file, contas_file
+            )
+        except Exception as e:
+            st.error(f"Erro ao processar: {e}")
 
 if st.session_state.dados_processados is not None:
     renderizar()
 else:
-    st.info("Importe os relatórios na barra lateral e clique em Analisar Dados.")
+    st.info(
+        "Conecte o GestãoClick ou use os arquivos Excel na barra lateral."
+    )
