@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -42,10 +43,38 @@ if "alteracao_gestaoclick_pendente" not in st.session_state:
     st.session_state.alteracao_gestaoclick_pendente = None
 if "metas_vendedor" not in st.session_state:
     st.session_state.metas_vendedor = {}
+if "contatos_realizados" not in st.session_state:
+    st.session_state.contatos_realizados = []
+if "retornos_programados" not in st.session_state:
+    st.session_state.retornos_programados = []
+if "observacoes_clientes" not in st.session_state:
+    st.session_state.observacoes_clientes = []
+if "persistencia_crm_carregada" not in st.session_state:
+    st.session_state.persistencia_crm_carregada = False
+if "persistencia_crm_tentada" not in st.session_state:
+    st.session_state.persistencia_crm_tentada = False
 
 NOME_PLANILHA = "CRM_HISTORICO_LUKATONER"
 USUARIO_PADRAO = "Gabriel"
 API_BASE = "https://api.gestaoclick.com"
+
+ABAS_CRM = {
+    "ContatosRealizados": [
+        "cliente_id", "cliente", "vendedor", "data", "hora",
+        "status", "observacao", "origem"
+    ],
+    "RetornosProgramados": [
+        "id", "cliente_id", "cliente", "vendedor", "data_retorno",
+        "motivo", "observacao", "status", "criado_em", "concluido_em"
+    ],
+    "ObservacoesClientes": [
+        "id", "cliente_id", "cliente", "vendedor", "data", "hora", "observacao"
+    ],
+    "ResumoDiario": [
+        "data", "vendedor", "clientes_para_ligar", "orcamentos_sem_retorno",
+        "proximos_recompra", "retornos_hoje", "risco_perda", "gerado_em"
+    ],
+}
 
 class GestaoClickAPI:
     def __init__(self, access_token, secret_token):
@@ -302,6 +331,147 @@ def aba_sheets(nome):
     planilha = conectar_google_sheets()
     return planilha.worksheet(nome)
 
+def garantir_abas_crm():
+    planilha = conectar_google_sheets()
+    existentes = {ws.title: ws for ws in planilha.worksheets()}
+    resultado = {}
+    for nome, cabecalhos in ABAS_CRM.items():
+        ws = existentes.get(nome)
+        if ws is None:
+            ws = planilha.add_worksheet(
+                title=nome, rows=1000, cols=max(10, len(cabecalhos))
+            )
+            ws.append_row(cabecalhos)
+        elif not ws.row_values(1):
+            ws.append_row(cabecalhos)
+        resultado[nome] = ws
+    return resultado
+
+def carregar_persistencia_crm():
+    st.session_state.persistencia_crm_tentada = True
+    try:
+        abas = garantir_abas_crm()
+        st.session_state.contatos_realizados = (
+            abas["ContatosRealizados"].get_all_records()
+        )
+        st.session_state.retornos_programados = (
+            abas["RetornosProgramados"].get_all_records()
+        )
+        st.session_state.observacoes_clientes = (
+            abas["ObservacoesClientes"].get_all_records()
+        )
+        st.session_state.persistencia_crm_carregada = True
+        return True
+    except Exception as e:
+        st.warning(
+            f"Não foi possível carregar a persistência do Google Sheets: {e}"
+        )
+        return False
+
+def cliente_corresponde(registro, cliente_id, cliente):
+    reg_id = str(registro.get("cliente_id", "")).strip()
+    if cliente_id and reg_id:
+        return reg_id == str(cliente_id).strip()
+    return norm(registro.get("cliente", "")) == norm(cliente)
+
+def salvar_contato_realizado(
+    cliente_id, cliente, vendedor, observacao="", origem="prioridade"
+):
+    agora = datetime.now()
+    registro = {
+        "cliente_id": str(cliente_id or ""),
+        "cliente": str(cliente),
+        "vendedor": str(vendedor or "Sem vendedor"),
+        "data": agora.strftime("%d/%m/%Y"),
+        "hora": agora.strftime("%H:%M:%S"),
+        "status": "já liguei",
+        "observacao": str(observacao or ""),
+        "origem": str(origem),
+    }
+    abas = garantir_abas_crm()
+    abas["ContatosRealizados"].append_row(list(registro.values()))
+    st.session_state.contatos_realizados.append(registro)
+
+    if observacao:
+        try:
+            salvar_observacao_cliente(
+                cliente_id, cliente, vendedor, observacao
+            )
+        except Exception as e:
+            st.warning(
+                f"Contato salvo, mas a observação não pôde ser duplicada "
+                f"no histórico: {e}"
+            )
+    concluir_retornos_do_cliente(cliente_id, cliente, agora.date())
+    return registro
+
+def salvar_observacao_cliente(cliente_id, cliente, vendedor, observacao):
+    agora = datetime.now()
+    registro = {
+        "id": str(uuid.uuid4()),
+        "cliente_id": str(cliente_id or ""),
+        "cliente": str(cliente),
+        "vendedor": str(vendedor or "Sem vendedor"),
+        "data": agora.strftime("%d/%m/%Y"),
+        "hora": agora.strftime("%H:%M:%S"),
+        "observacao": str(observacao).strip(),
+    }
+    abas = garantir_abas_crm()
+    abas["ObservacoesClientes"].append_row(list(registro.values()))
+    st.session_state.observacoes_clientes.append(registro)
+    return registro
+
+def agendar_retorno_cliente(
+    cliente_id, cliente, vendedor, data_retorno, motivo, observacao
+):
+    agora = datetime.now()
+    registro = {
+        "id": str(uuid.uuid4()),
+        "cliente_id": str(cliente_id or ""),
+        "cliente": str(cliente),
+        "vendedor": str(vendedor or "Sem vendedor"),
+        "data_retorno": data_retorno.strftime("%d/%m/%Y"),
+        "motivo": str(motivo or "Retorno comercial"),
+        "observacao": str(observacao or ""),
+        "status": "pendente",
+        "criado_em": agora.strftime("%d/%m/%Y %H:%M:%S"),
+        "concluido_em": "",
+    }
+    abas = garantir_abas_crm()
+    abas["RetornosProgramados"].append_row(list(registro.values()))
+    st.session_state.retornos_programados.append(registro)
+    return registro
+
+def concluir_retornos_do_cliente(cliente_id, cliente, data_limite):
+    pendentes = []
+    for retorno in st.session_state.retornos_programados:
+        data_retorno = pd.to_datetime(
+            retorno.get("data_retorno"), dayfirst=True, errors="coerce"
+        )
+        if (
+            str(retorno.get("status", "")).strip().lower() == "pendente"
+            and cliente_corresponde(retorno, cliente_id, cliente)
+            and pd.notna(data_retorno)
+            and data_retorno.date() <= data_limite
+        ):
+            pendentes.append(retorno)
+    if not pendentes:
+        return
+    try:
+        ws = garantir_abas_crm()["RetornosProgramados"]
+        registros = ws.get_all_records()
+        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        for retorno in pendentes:
+            for linha, atual in enumerate(registros, start=2):
+                if str(atual.get("id")) == str(retorno.get("id")):
+                    ws.update_cell(linha, 8, "concluído")
+                    ws.update_cell(linha, 10, agora)
+                    retorno["status"] = "concluído"
+                    retorno["concluido_em"] = agora
+                    break
+    except Exception as e:
+        st.warning(f"Contato salvo, mas o retorno não pôde ser concluído: {e}")
+
 def carregar_clientes_ligados_hoje():
     try:
         ws = aba_sheets("clientes_ligados")
@@ -414,7 +584,7 @@ def status_orcamento(dias):
     if dias == 2:
         return "📞 Ligar hoje"
     if dias == 3:
-        return "⚠️ Está perdendo tempo"
+        return "⚠️ Urgente"
     return "🚨 Risco de ter perdido"
 
 def score_risco(media_atraso):
@@ -999,6 +1169,8 @@ def processar_dataframes(vendas, orc, contas):
     cv_valor = achar_coluna(vendas, ["valor"])
     cv_custo = achar_coluna(vendas, ["custo"])
     cv_status = achar_coluna(vendas, ["situacao", "status"])
+    cv_vendedor = achar_coluna(vendas, ["vendedor"])
+    cv_vendedor_id = achar_coluna(vendas, ["vendedor id"])
     co_num = achar_coluna(orc, ["nº", "n°", "numero", "número"])
     co_cli = achar_coluna(orc, ["cliente"])
     co_data = achar_coluna(orc, ["data"])
@@ -1083,6 +1255,22 @@ def processar_dataframes(vendas, orc, contas):
     })
     clientes.columns = ["Cliente", "ultima_compra", "qtd_compras", "faturamento"]
     clientes = clientes.reset_index().rename(columns={"_cliente_chave": "Cliente ID"})
+
+    vendas_recentes = vendas.sort_values(cv_data).drop_duplicates(
+        "_cliente_chave", keep="last"
+    ).set_index("_cliente_chave")
+    if cv_vendedor:
+        clientes["Vendedor"] = clientes["Cliente ID"].map(
+            vendas_recentes[cv_vendedor]
+        ).fillna("Sem vendedor")
+    else:
+        clientes["Vendedor"] = "Sem vendedor"
+    if cv_vendedor_id:
+        clientes["Vendedor ID"] = clientes["Cliente ID"].map(
+            vendas_recentes[cv_vendedor_id]
+        ).fillna("")
+    else:
+        clientes["Vendedor ID"] = ""
 
     intervalo = vendas.sort_values(cv_data).groupby("_cliente_chave")[cv_data].apply(
         lambda x: x.diff().mean().days if len(x.dropna()) > 1 else 0
@@ -1332,17 +1520,192 @@ def processar_api(
     })
     return dados
 
+def contato_realizado_hoje(cliente_id, cliente):
+    hoje = date.today().strftime("%d/%m/%Y")
+    return any(
+        str(registro.get("data", "")).strip() == hoje
+        and cliente_corresponde(registro, cliente_id, cliente)
+        for registro in st.session_state.contatos_realizados
+    ) or cliente in st.session_state.clientes_ligados
+
+def retornos_pendentes_cliente(cliente_id, cliente):
+    hoje = pd.Timestamp(date.today())
+    pendentes = []
+    for registro in st.session_state.retornos_programados:
+        data_retorno = pd.to_datetime(
+            registro.get("data_retorno"), dayfirst=True, errors="coerce"
+        )
+        if (
+            str(registro.get("status", "")).strip().lower() == "pendente"
+            and cliente_corresponde(registro, cliente_id, cliente)
+            and pd.notna(data_retorno)
+            and data_retorno.normalize() <= hoje
+        ):
+            pendentes.append(registro)
+    return pendentes
+
+def enriquecer_regras_prioridade(clientes, orc_aberto):
+    base = clientes.copy()
+    co_cli = achar_coluna(orc_aberto, ["cliente"])
+    co_cli_id = achar_coluna(orc_aberto, ["cliente id"])
+    if orc_aberto.empty:
+        contagens = {}
+    else:
+        orcs = orc_aberto.copy()
+        if co_cli_id:
+            ids = orcs[co_cli_id].astype(str).str.strip()
+            ids_invalidos = ids.str.lower().isin({"", "nan", "none"})
+            orcs["_cliente_chave_prioridade"] = ids.where(
+                ~ids_invalidos, orcs[co_cli].map(norm)
+            )
+        else:
+            orcs["_cliente_chave_prioridade"] = orcs[co_cli].map(norm)
+        contagens = {
+            chave: {
+                "orc_ligar": int((grupo["dias_no_sistema"] == 2).sum()),
+                "orc_urgente": int((grupo["dias_no_sistema"] == 3).sum()),
+                "orc_risco": int((grupo["dias_no_sistema"] >= 4).sum()),
+            }
+            for chave, grupo in orcs.groupby("_cliente_chave_prioridade")
+        }
+
+    regras = []
+    for _, row in base.iterrows():
+        cliente_id = str(row.get("Cliente ID", "")).strip()
+        chave = (
+            cliente_id
+            if cliente_id and cliente_id.lower() not in {"nan", "none"}
+            else norm(row["Cliente"])
+        )
+        orc = contagens.get(chave, {})
+        retornos = retornos_pendentes_cliente(cliente_id, row["Cliente"])
+        proximo_recompra = bool(
+            row["intervalo"] > 0
+            and row["dias_sem_comprar"] >= row["intervalo"] * 0.9
+        )
+        motivos = []
+        if retornos:
+            motivos.append("Retorno programado")
+        if orc.get("orc_risco", 0):
+            motivos.append("Orçamento em risco de perda")
+        elif orc.get("orc_urgente", 0):
+            motivos.append("Orçamento urgente")
+        elif orc.get("orc_ligar", 0):
+            motivos.append("Orçamento: ligar hoje")
+        if proximo_recompra:
+            motivos.append("Próximo da recompra")
+        if row["intervalo"] > 0 and row["dias_sem_comprar"] > row["intervalo"] * 1.2:
+            motivos.append("Ciclo de compra vencido")
+
+        regras.append({
+            "orc_ligar": orc.get("orc_ligar", 0),
+            "orc_urgente": orc.get("orc_urgente", 0),
+            "orc_risco": orc.get("orc_risco", 0),
+            "retornos_hoje": len(retornos),
+            "proximo_recompra": proximo_recompra,
+            "ja_ligou_hoje": contato_realizado_hoje(cliente_id, row["Cliente"]),
+            "motivo_prioridade": " | ".join(motivos),
+        })
+    regras_df = pd.DataFrame(regras, index=base.index)
+    for coluna in regras_df:
+        base[coluna] = regras_df[coluna]
+    base["score_prioridade_dia"] = (
+        base["score_comercial"]
+        + base["retornos_hoje"] * 100
+        + base["orc_risco"] * 60
+        + base["orc_urgente"] * 45
+        + base["orc_ligar"] * 30
+        + base["proximo_recompra"].astype(int) * 15
+    )
+    return base
+
 def montar_prioridade(clientes):
+    elegivel = (
+        clientes["retornos_hoje"].gt(0)
+        | clientes["orc_ligar"].gt(0)
+        | clientes["orc_urgente"].gt(0)
+        | clientes["orc_risco"].gt(0)
+        | clientes["proximo_recompra"]
+    )
     return clientes[
-        (clientes["temperatura"] == "🟢 QUENTE") &
-        (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
-    ].sort_values("score_comercial", ascending=False)
+        elegivel & (~clientes["ja_ligou_hoje"])
+    ].sort_values("score_prioridade_dia", ascending=False)
 
 def montar_resumo(clientes):
+    temperaturas = clientes["temperatura"].isin([
+        "🟢 QUENTE", "🟡 ATENÇÃO", "🔴 ATRASADO NA RECOMPRA", "⚫ CLIENTE INATIVO"
+    ])
+    regras = (
+        clientes["retornos_hoje"].gt(0)
+        | clientes["orc_ligar"].gt(0)
+        | clientes["orc_urgente"].gt(0)
+        | clientes["orc_risco"].gt(0)
+    )
     return clientes[
-        (clientes["temperatura"].isin(["🟢 QUENTE", "🟡 ATENÇÃO", "🔴 ATRASADO NA RECOMPRA", "⚫ CLIENTE INATIVO"])) &
-        (~clientes["Cliente"].isin(st.session_state.clientes_ligados))
-    ].sort_values("score_comercial", ascending=False)
+        (temperaturas | regras) & (~clientes["ja_ligou_hoje"])
+    ].sort_values("score_prioridade_dia", ascending=False)
+
+def montar_resumo_diario(clientes):
+    colunas = [
+        "Vendedor", "Clientes para ligar", "Orcamentos sem retorno",
+        "Proximos da recompra", "Retornos hoje", "Risco de perda"
+    ]
+    if clientes.empty:
+        return pd.DataFrame(columns=colunas)
+
+    base = clientes[~clientes["ja_ligou_hoje"]].copy()
+    if "Vendedor" not in base.columns:
+        base["Vendedor"] = "Sem vendedor"
+    base["Vendedor"] = (
+        base["Vendedor"].fillna("Sem vendedor").astype(str).str.strip()
+        .replace({"": "Sem vendedor", "nan": "Sem vendedor"})
+    )
+    base["_cliente_para_ligar"] = (
+        base["retornos_hoje"].gt(0)
+        | base["orc_ligar"].gt(0)
+        | base["orc_urgente"].gt(0)
+        | base["orc_risco"].gt(0)
+        | base["proximo_recompra"]
+    ).astype(int)
+    base["_orcamentos_sem_retorno"] = (
+        base["orc_ligar"] + base["orc_urgente"] + base["orc_risco"]
+    )
+    resumo = base.groupby("Vendedor", as_index=False).agg(
+        **{
+            "Clientes para ligar": ("_cliente_para_ligar", "sum"),
+            "Orcamentos sem retorno": ("_orcamentos_sem_retorno", "sum"),
+            "Proximos da recompra": ("proximo_recompra", "sum"),
+            "Retornos hoje": ("retornos_hoje", "sum"),
+            "Risco de perda": ("orc_risco", "sum"),
+        }
+    )
+    return resumo.sort_values(
+        ["Clientes para ligar", "Risco de perda"], ascending=False
+    )
+
+def salvar_resumo_diario(resumo):
+    if resumo.empty:
+        return
+    ws = garantir_abas_crm()["ResumoDiario"]
+    registros = ws.get_all_records()
+    hoje = date.today().strftime("%d/%m/%Y")
+    gerado_em = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    linhas_existentes = {
+        (str(r.get("data", "")).strip(), str(r.get("vendedor", "")).strip()): i
+        for i, r in enumerate(registros, start=2)
+    }
+    for _, row in resumo.iterrows():
+        valores = [
+            hoje, row["Vendedor"], int(row["Clientes para ligar"]),
+            int(row["Orcamentos sem retorno"]),
+            int(row["Proximos da recompra"]), int(row["Retornos hoje"]),
+            int(row["Risco de perda"]), gerado_em
+        ]
+        linha = linhas_existentes.get((hoje, str(row["Vendedor"]).strip()))
+        if linha:
+            ws.update(f"A{linha}:H{linha}", [valores])
+        else:
+            ws.append_row(valores)
 
 def calcular_churn(clientes):
     clientes_com_ciclo = clientes[clientes["intervalo"] > 0]
@@ -1378,6 +1741,86 @@ def identificador_cliente(row, fallback=""):
         return cliente_id
     return f"{norm(row.get('Cliente', 'cliente'))}_{fallback}"
 
+def registros_do_cliente(registros, cliente_id, cliente):
+    return [
+        registro for registro in registros
+        if cliente_corresponde(registro, cliente_id, cliente)
+    ]
+
+def ordenar_registros(registros, campo_data="data", campo_hora="hora"):
+    def chave(registro):
+        texto = str(registro.get(campo_data, ""))
+        if campo_hora:
+            texto += " " + str(registro.get(campo_hora, ""))
+        data_registro = pd.to_datetime(texto, dayfirst=True, errors="coerce")
+        return data_registro if pd.notna(data_registro) else pd.Timestamp.min
+    return sorted(registros, key=chave, reverse=True)
+
+def renderizar_historico_cliente(row):
+    cliente_id = str(row.get("Cliente ID", "")).strip()
+    cliente = str(row["Cliente"])
+    contatos = ordenar_registros(registros_do_cliente(
+        st.session_state.contatos_realizados, cliente_id, cliente
+    ))
+    observacoes = ordenar_registros(registros_do_cliente(
+        st.session_state.observacoes_clientes, cliente_id, cliente
+    ))
+    retornos = ordenar_registros(
+        registros_do_cliente(
+            st.session_state.retornos_programados, cliente_id, cliente
+        ),
+        "data_retorno", None
+    )
+    ultima_compra = row.get("ultima_compra")
+    ultima_compra_txt = (
+        ultima_compra.strftime("%d/%m/%Y")
+        if pd.notna(ultima_compra) else "Não informada"
+    )
+
+    st.write(f"**Vendedor responsável:** {row.get('Vendedor', 'Sem vendedor')}")
+    st.write(f"**Status atual:** {row.get('temperatura', 'Não informado')}")
+    st.write(f"**Última compra:** {ultima_compra_txt}")
+
+    st.markdown("**Orçamentos em aberto**")
+    numeros = row.get("numeros_orcamentos", [])
+    st.write(", ".join(str(numero) for numero in numeros[-5:])) if numeros else st.caption(
+        "Nenhum orçamento em aberto."
+    )
+
+    st.markdown("**Últimos contatos**")
+    if contatos:
+        for contato in contatos[:5]:
+            detalhe = (
+                f"{contato.get('data', '')} {contato.get('hora', '')} - "
+                f"{contato.get('status', 'contato')}"
+            )
+            if str(contato.get("observacao", "")).strip():
+                detalhe += f": {contato['observacao']}"
+            st.write(detalhe)
+    else:
+        st.caption("Nenhum contato registrado.")
+
+    st.markdown("**Últimas observações**")
+    if observacoes:
+        for observacao in observacoes[:5]:
+            st.write(
+                f"{observacao.get('data', '')} {observacao.get('hora', '')} - "
+                f"{observacao.get('observacao', '')}"
+            )
+    else:
+        st.caption("Nenhuma observação registrada.")
+
+    st.markdown("**Retornos programados**")
+    if retornos:
+        for retorno in retornos[:5]:
+            st.write(
+                f"{retorno.get('data_retorno', '')} - "
+                f"{retorno.get('motivo', 'Retorno comercial')} "
+                f"({retorno.get('status', 'pendente')})"
+            )
+    else:
+        st.caption("Nenhum retorno programado.")
+
 def card_cliente(row, tipo, posicao):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
@@ -1385,6 +1828,8 @@ def card_cliente(row, tipo, posicao):
     temperatura_html = html_seguro(row["temperatura"])
     risco_html = html_seguro(row["risco_inadimplencia"])
     acao_html = html_seguro(row["acao_ia"])
+    vendedor_html = html_seguro(row.get("Vendedor", "Sem vendedor"))
+    motivo_html = html_seguro(row.get("motivo_prioridade", ""))
 
     st.markdown(f"""
 <div style="background:white;padding:15px;border-radius:10px;margin-bottom:10px;border:1px solid #ddd;">
@@ -1399,27 +1844,77 @@ Ticket médio: <b>{fmt_html(row['ticket_medio'])}</b><br>
 Potencial mensal: <b>{fmt_html(row['potencial_mensal'])}</b><br>
 Potencial recuperável: <b>{fmt_html(row['potencial_recuperavel'])}</b><br>
 Orçamentos em aberto: <b>{int(row['orcamentos_em_aberto'])}</b><br>
+Vendedor responsável: <b>{vendedor_html}</b><br>
 Inadimplência: <b>{fmt_html(row['inadimplencia'])}</b><br>
 Score de risco: <b>{int(row['score_risco'])}/100 — {risco_html}</b><br><br>
+Prioridade de hoje: <b>{motivo_html or 'Acompanhamento comercial'}</b><br>
 Recomendação: <b>{acao_html}</b>
 </div>
 """, unsafe_allow_html=True)
 
-    with st.expander("Ver orçamentos em aberto"):
-        if row["numeros_orcamentos"]:
-            for num in row["numeros_orcamentos"]:
-                st.write(f"• Orçamento Nº {num}")
-        else:
-            st.write("Nenhum orçamento em aberto.")
-
     cliente_uid = chave_widget(identificador_cliente(row, posicao))
+    chave_base = f"{tipo}_{cliente_uid}_{chave_widget(posicao)}"
+    sufixo_uid = cliente_uid[-6:]
+
+    with st.expander(f"Ver Histórico - {row['Cliente']} #{sufixo_uid}"):
+        renderizar_historico_cliente(row)
+
+    observacao_contato = st.text_input(
+        "Observação do contato (opcional)",
+        key=f"obs_contato_{chave_base}"
+    )
     if st.button(
-        f"✅ Já liguei - {row['Cliente']}",
-        key=f"liguei_{tipo}_{cliente_uid}_{posicao}"
+        f"Já Liguei - {row['Cliente']}",
+        key=f"liguei_{chave_base}",
+        type="primary"
     ):
-        st.session_state.clientes_ligados.add(row["Cliente"])
-        salvar_cliente_ligado(row["Cliente"], tipo)
-        st.rerun()
+        try:
+            salvar_contato_realizado(
+                row.get("Cliente ID", ""),
+                row["Cliente"],
+                row.get("Vendedor", "Sem vendedor"),
+                observacao_contato,
+                tipo
+            )
+            st.session_state.clientes_ligados.add(row["Cliente"])
+            st.success("Contato registrado. O cliente saiu das prioridades de hoje.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Não foi possível registrar o contato: {e}")
+
+    with st.expander(f"Agendar Retorno - {row['Cliente']} #{sufixo_uid}"):
+        data_retorno = st.date_input(
+            "Data do retorno",
+            value=date.today() + timedelta(days=1),
+            min_value=date.today(),
+            key=f"data_retorno_{chave_base}"
+        )
+        motivo_retorno = st.text_input(
+            "Motivo do retorno",
+            value="Retorno comercial",
+            key=f"motivo_retorno_{chave_base}"
+        )
+        observacao_retorno = st.text_area(
+            "Observação",
+            key=f"obs_retorno_{chave_base}"
+        )
+        if st.button(
+            "Salvar Retorno",
+            key=f"salvar_retorno_{chave_base}"
+        ):
+            try:
+                agendar_retorno_cliente(
+                    row.get("Cliente ID", ""),
+                    row["Cliente"],
+                    row.get("Vendedor", "Sem vendedor"),
+                    data_retorno,
+                    motivo_retorno,
+                    observacao_retorno
+                )
+                st.success(f"Retorno agendado para {data_retorno:%d/%m/%Y}.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível agendar o retorno: {e}")
 
 def gerar_texto_email(
     prioridade, orc_aberto, clientes, clientes_churn,
@@ -2163,8 +2658,9 @@ def renderizar_qualidade_dados(dados):
 
 def renderizar():
     dados = st.session_state.dados_processados
-    clientes = dados["clientes"]
     orc_aberto = dados["orc_aberto"]
+    clientes = enriquecer_regras_prioridade(dados["clientes"], orc_aberto)
+    dados["clientes"] = clientes
     co_num = dados["co_num"]
     co_cli = dados["co_cli"]
     co_valor = dados["co_valor"]
@@ -2181,6 +2677,7 @@ def renderizar():
 
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
+    resumo_diario = montar_resumo_diario(clientes)
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
     clientes_churn = listar_clientes_churn(clientes)
     churn_avancado = calcular_churn_avancado(dados)
@@ -2197,9 +2694,9 @@ def renderizar():
     else:
         st.info("Dados carregados por arquivos Excel.")
 
-    aba_ceo, aba_financeiro, aba_comercial, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_qualidade, aba_base, aba_email, aba_relatorio = st.tabs([
+    aba_ceo, aba_financeiro, aba_comercial, aba_churn, aba_prioridade, aba_resumo_diario, aba_resumo, aba_orc, aba_gestao, aba_qualidade, aba_base, aba_email, aba_relatorio = st.tabs([
         "👑 CEO", "💰 Financeiro CEO", "🎯 Gestão Comercial", "📉 Churn",
-        "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão",
+        "🔥 Prioridade", "📅 Resumo Diário", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão",
         "✅ Qualidade", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
 
@@ -2343,6 +2840,45 @@ Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
             for j, (indice, row) in enumerate(cards[i:i+3]):
                 with cols[j]:
                     card_cliente(row, "prioridade", f"{indice}_{i}_{j}")
+
+    with aba_resumo_diario:
+        st.subheader("📅 Resumo Diário por Vendedora")
+        st.caption(
+            "As prioridades respeitam a vendedora responsável pela última venda "
+            "registrada para cada cliente."
+        )
+        if resumo_diario.empty:
+            st.info("Nenhuma prioridade comercial para hoje.")
+        else:
+            for _, linha in resumo_diario.iterrows():
+                st.markdown(f"#### {linha['Vendedor']}")
+                colunas = st.columns(5)
+                colunas[0].metric(
+                    "Clientes para ligar", int(linha["Clientes para ligar"])
+                )
+                colunas[1].metric(
+                    "Orçamentos sem retorno",
+                    int(linha["Orcamentos sem retorno"])
+                )
+                colunas[2].metric(
+                    "Próximos da recompra",
+                    int(linha["Proximos da recompra"])
+                )
+                colunas[3].metric(
+                    "Retornos hoje", int(linha["Retornos hoje"])
+                )
+                colunas[4].metric(
+                    "Risco de perda", int(linha["Risco de perda"])
+                )
+            if st.button(
+                "Salvar Resumo Diário no Google Sheets",
+                key="salvar_resumo_diario"
+            ):
+                try:
+                    salvar_resumo_diario(resumo_diario)
+                    st.success("Resumo diário salvo na aba ResumoDiario.")
+                except Exception as e:
+                    st.error(f"Não foi possível salvar o resumo diário: {e}")
 
     with aba_resumo:
         st.subheader("📋 Resumo Comercial")
@@ -2730,6 +3266,7 @@ if modo_dados == "API GestãoClick":
                     "Buscando vendas, orçamentos, contas a receber, contas a pagar e movimentos do mês..."
                 ):
                     st.session_state.clientes_ligados = carregar_clientes_ligados_hoje()
+                    carregar_persistencia_crm()
                     st.session_state.observacoes_orc = {}
                     st.session_state.dados_processados = processar_api(
                         api_gestaoclick(),
@@ -2768,6 +3305,7 @@ else:
 
         try:
             st.session_state.clientes_ligados = carregar_clientes_ligados_hoje()
+            carregar_persistencia_crm()
             st.session_state.observacoes_orc = carregar_observacoes_orcamentos()
             st.session_state.dados_processados = processar_dados(
                 vendas_file, orc_file, contas_file
@@ -2776,6 +3314,8 @@ else:
             st.error(f"Erro ao processar: {e}")
 
 if st.session_state.dados_processados is not None:
+    if not st.session_state.persistencia_crm_tentada:
+        carregar_persistencia_crm()
     renderizar()
 else:
     st.info(
