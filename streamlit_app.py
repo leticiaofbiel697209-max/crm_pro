@@ -2677,7 +2677,6 @@ def renderizar():
 
     prioridade = montar_prioridade(clientes)
     resumo = montar_resumo(clientes)
-    resumo_diario = montar_resumo_diario(clientes)
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
     clientes_churn = listar_clientes_churn(clientes)
     churn_avancado = calcular_churn_avancado(dados)
@@ -2694,9 +2693,9 @@ def renderizar():
     else:
         st.info("Dados carregados por arquivos Excel.")
 
-    aba_ceo, aba_financeiro, aba_comercial, aba_churn, aba_prioridade, aba_resumo_diario, aba_resumo, aba_orc, aba_gestao, aba_qualidade, aba_base, aba_email, aba_relatorio = st.tabs([
+    aba_ceo, aba_financeiro, aba_comercial, aba_churn, aba_prioridade, aba_resumo, aba_orc, aba_gestao, aba_qualidade, aba_base, aba_email, aba_relatorio = st.tabs([
         "👑 CEO", "💰 Financeiro CEO", "🎯 Gestão Comercial", "📉 Churn",
-        "🔥 Prioridade", "📅 Resumo Diário", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão",
+        "🔥 Prioridade", "📋 Resumo", "📄 Orçamentos", "🧠 Gestão",
         "✅ Qualidade", "📊 Base", "✉️ Resumo E-mail", "📧 Relatório Comercial"
     ])
 
@@ -2840,45 +2839,6 @@ Inadimplência: <b>{fmt_html(r['inadimplencia'])}</b>
             for j, (indice, row) in enumerate(cards[i:i+3]):
                 with cols[j]:
                     card_cliente(row, "prioridade", f"{indice}_{i}_{j}")
-
-    with aba_resumo_diario:
-        st.subheader("📅 Resumo Diário por Vendedora")
-        st.caption(
-            "As prioridades respeitam a vendedora responsável pela última venda "
-            "registrada para cada cliente."
-        )
-        if resumo_diario.empty:
-            st.info("Nenhuma prioridade comercial para hoje.")
-        else:
-            for _, linha in resumo_diario.iterrows():
-                st.markdown(f"#### {linha['Vendedor']}")
-                colunas = st.columns(5)
-                colunas[0].metric(
-                    "Clientes para ligar", int(linha["Clientes para ligar"])
-                )
-                colunas[1].metric(
-                    "Orçamentos sem retorno",
-                    int(linha["Orcamentos sem retorno"])
-                )
-                colunas[2].metric(
-                    "Próximos da recompra",
-                    int(linha["Proximos da recompra"])
-                )
-                colunas[3].metric(
-                    "Retornos hoje", int(linha["Retornos hoje"])
-                )
-                colunas[4].metric(
-                    "Risco de perda", int(linha["Risco de perda"])
-                )
-            if st.button(
-                "Salvar Resumo Diário no Google Sheets",
-                key="salvar_resumo_diario"
-            ):
-                try:
-                    salvar_resumo_diario(resumo_diario)
-                    st.success("Resumo diário salvo na aba ResumoDiario.")
-                except Exception as e:
-                    st.error(f"Não foi possível salvar o resumo diário: {e}")
 
     with aba_resumo:
         st.subheader("📋 Resumo Comercial")
