@@ -235,6 +235,75 @@ def custo_total_venda(item):
         ).fillna(0).iloc[0])
     return custo
 
+def valor_numerico_simples(valor, padrao=0.0):
+    convertido = pd.to_numeric(pd.Series([valor]), errors="coerce")
+    if convertido.isna().iloc[0]:
+        return padrao
+    return float(convertido.iloc[0])
+
+def extrair_itens_registro(registro):
+    itens = []
+    for campo, chave_detalhe in (("produtos", "produto"), ("servicos", "servico")):
+        for wrapper in registro.get(campo) or []:
+            detalhe = wrapper.get(chave_detalhe) or {}
+            nome = (
+                detalhe.get("nome")
+                or detalhe.get("descricao")
+                or wrapper.get("nome")
+                or wrapper.get("descricao")
+                or detalhe.get("codigo")
+                or wrapper.get("codigo")
+                or "Item sem nome"
+            )
+            quantidade = (
+                wrapper.get("quantidade")
+                or detalhe.get("quantidade")
+                or wrapper.get("qtd")
+                or 1
+            )
+            valor = (
+                wrapper.get("valor_total")
+                or wrapper.get("valor")
+                or wrapper.get("valor_unitario")
+                or detalhe.get("valor_total")
+                or detalhe.get("valor")
+                or detalhe.get("valor_venda")
+                or 0
+            )
+            qtd = valor_numerico_simples(quantidade, 1)
+            valor_item = valor_numerico_simples(valor, 0)
+            partes = [str(nome).strip()]
+            if qtd:
+                partes.append(f"qtd. {qtd:g}")
+            if valor_item:
+                partes.append(fmt(valor_item))
+            itens.append(" | ".join(partes))
+    return itens
+
+def agregar_itens_cliente(df, chave_coluna, itens_coluna):
+    if df.empty or chave_coluna not in df.columns or itens_coluna not in df.columns:
+        return pd.Series(dtype=object)
+
+    def juntar(series):
+        itens = []
+        vistos = set()
+        for valor in series:
+            if isinstance(valor, list):
+                candidatos = valor
+            elif pd.isna(valor) or not str(valor).strip():
+                candidatos = []
+            else:
+                candidatos = [str(valor).strip()]
+            for item in candidatos:
+                texto = str(item).strip()
+                chave = norm(texto)
+                if texto and chave not in vistos:
+                    vistos.add(chave)
+                    itens.append(texto)
+        return itens
+
+    return df.groupby(chave_coluna)[itens_coluna].apply(juntar)
+
     def budget(self, budget_id, store_id):
         return self.request(
             f"/orcamentos/{budget_id}", {"loja_id": store_id}
@@ -1171,11 +1240,14 @@ def processar_dataframes(vendas, orc, contas):
     cv_status = achar_coluna(vendas, ["situacao", "status"])
     cv_vendedor = achar_coluna(vendas, ["vendedor"])
     cv_vendedor_id = achar_coluna(vendas, ["vendedor id"])
+    cv_item = achar_coluna(vendas, ["produto", "servico", "serviço", "item", "descricao", "descrição"])
     co_num = achar_coluna(orc, ["nº", "n°", "numero", "número"])
     co_cli = achar_coluna(orc, ["cliente"])
+    co_cli_id = achar_coluna(orc, ["cliente id"])
     co_data = achar_coluna(orc, ["data"])
     co_status = achar_coluna(orc, ["situação", "situacao", "status"])
     co_valor = achar_coluna(orc, ["valor"])
+    co_item = achar_coluna(orc, ["produto", "servico", "serviço", "item", "descricao", "descrição"])
     cc_cli = achar_coluna(contas, ["cliente", "destinado"])
     cc_cli_id = achar_coluna(contas, ["cliente id"])
     cc_venc = achar_coluna(contas, ["vencimento"])
@@ -1216,6 +1288,11 @@ def processar_dataframes(vendas, orc, contas):
         vendas["_cliente_chave"].isin(["", "none", "nan"]), cv_cli
     ].map(norm)
     vendas["_cliente_nome"] = vendas[cv_cli].astype(str).str.strip()
+    if "_itens_texto" not in vendas.columns:
+        vendas["_itens_texto"] = (
+            vendas[cv_item].astype(str).str.strip()
+            if cv_item else ""
+        )
 
     vendas_canceladas = pd.DataFrame()
     if cv_status:
@@ -1228,6 +1305,22 @@ def processar_dataframes(vendas, orc, contas):
     orc[co_data] = data_coluna(orc[co_data])
     if co_valor:
         orc[co_valor] = numero_coluna(orc[co_valor])
+    orc["_cliente_chave"] = (
+        orc[co_cli_id].astype(str).str.strip()
+        if co_cli_id
+        else orc[co_cli].map(norm)
+    )
+    orc.loc[
+        orc["_cliente_chave"].isin(["", "none", "nan"]),
+        "_cliente_chave"
+    ] = orc.loc[
+        orc["_cliente_chave"].isin(["", "none", "nan"]), co_cli
+    ].map(norm)
+    if "_itens_texto" not in orc.columns:
+        orc["_itens_texto"] = (
+            orc[co_item].astype(str).str.strip()
+            if co_item else ""
+        )
 
     contas[cc_valor] = numero_coluna(contas[cc_valor])
     if cc_venc:
@@ -1284,6 +1377,14 @@ def processar_dataframes(vendas, orc, contas):
     vendas_3m = vendas[vendas[cv_data] >= data_limite_3m].copy()
     potencial_3m = vendas_3m.groupby("_cliente_chave")[cv_valor].sum() / 3
     clientes["potencial_mensal"] = clientes["Cliente ID"].map(potencial_3m).fillna(0)
+    itens_comprados = agregar_itens_cliente(vendas, "_cliente_chave", "_itens_texto")
+    clientes["itens_comprados"] = clientes["Cliente ID"].map(itens_comprados).apply(
+        lambda x: x if isinstance(x, list) else []
+    )
+    itens_orcados = agregar_itens_cliente(orc, "_cliente_chave", "_itens_texto")
+    clientes["itens_orcados"] = clientes["Cliente ID"].map(itens_orcados).apply(
+        lambda x: x if isinstance(x, list) else []
+    )
 
     orcamentos_todos = orc.copy()
     orc_aberto = orc.copy()
@@ -1431,6 +1532,7 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
         "Vendedor": item.get("nome_vendedor") or "Sem vendedor",
         "Observacoes": item.get("observacoes") or "",
         "Observacoes internas": item.get("observacoes_interna") or "",
+        "_itens_texto": extrair_itens_registro(item),
         "Vendedor ID": item.get("vendedor_id"),
         "_venda_id": item.get("id"),
     } for item in vendas_api])
@@ -1443,6 +1545,7 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
         "Situacao": item.get("nome_situacao") or "",
         "Valor": item.get("valor_total") or 0,
         "Vendedor": item.get("nome_vendedor") or "Sem vendedor",
+        "_itens_texto": extrair_itens_registro(item),
         "_orcamento_id": item.get("id"),
         "_observacoes_interna": item.get("observacoes_interna") or "",
     } for item in orcamentos_api])
@@ -1465,13 +1568,13 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
     if vendas.empty:
         vendas = pd.DataFrame(columns=[
             "Cliente", "Cliente ID", "Data", "Valor", "Custo", "Situacao",
-            "Vendedor", "Vendedor ID", "_venda_id"
+            "Vendedor", "Vendedor ID", "_itens_texto", "_venda_id"
         ])
     if orcamentos.empty:
         orcamentos = pd.DataFrame(columns=[
             "Numero", "Cliente", "Cliente ID", "Data", "Situacao", "Valor", "Vendedor",
             "Observacoes", "Observacoes internas",
-            "_orcamento_id", "_observacoes_interna"
+            "_itens_texto", "_orcamento_id", "_observacoes_interna"
         ])
     if contas.empty:
         contas = pd.DataFrame(columns=[
@@ -1820,6 +1923,16 @@ def renderizar_historico_cliente(row):
             )
     else:
         st.caption("Nenhum retorno programado.")
+
+def renderizar_lista_itens(titulo, itens):
+    st.markdown(f"**{titulo}**")
+    if not itens:
+        st.caption("Nenhum item encontrado para este cliente.")
+        return
+    for item in itens[:30]:
+        st.write(f"- {item}")
+    if len(itens) > 30:
+        st.caption(f"Mostrando 30 de {len(itens)} itens encontrados.")
 
 def card_cliente(row, tipo, posicao):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
@@ -3027,6 +3140,16 @@ Score de risco: <b>{int(r['score_risco'])}/100 — {risco_html}</b><br>
 Recomendação: <b>{acao_html}</b>
 </div>
 """, unsafe_allow_html=True)
+                    cliente_uid = chave_widget(identificador_cliente(r, f"base_{i}_{j}"))
+                    with st.expander(f"Ver itens comprados e orçados - {r['Cliente']} #{cliente_uid[-6:]}"):
+                        renderizar_lista_itens(
+                            "Itens comprados",
+                            r.get("itens_comprados", [])
+                        )
+                        renderizar_lista_itens(
+                            "Itens orçados",
+                            r.get("itens_orcados", [])
+                        )
 
     with aba_email:
         st.subheader("✉️ Resumo para E-mail")
