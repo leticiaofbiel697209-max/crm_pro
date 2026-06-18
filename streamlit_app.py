@@ -98,7 +98,7 @@ class GestaoClickAPI:
             url, data=data, headers=self.headers, method=method
         )
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -108,6 +108,11 @@ class GestaoClickAPI:
         except urllib.error.URLError as exc:
             raise RuntimeError(
                 f"Não foi possível acessar o GestãoClick: {exc.reason}"
+            ) from exc
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "O GestãoClick demorou para responder. Tente novamente em alguns "
+                "segundos ou confira os tokens."
             ) from exc
         finally:
             self.last_request = time.monotonic()
@@ -126,6 +131,8 @@ class GestaoClickAPI:
             query.update({"pagina": page, "limite": 100})
             payload = self.request(path, query)
             page_records = payload.get("data") or []
+            if not page_records:
+                break
             records.extend(page_records)
             meta = payload.get("meta") or {}
             if not meta.get("proxima_pagina") and len(page_records) < 100:
@@ -205,6 +212,41 @@ class GestaoClickAPI:
             "data_fim": end_date.isoformat(),
             "liquidado": "pg",
         })
+
+    def budget(self, budget_id, store_id):
+        return self.request(
+            f"/orcamentos/{budget_id}", {"loja_id": store_id}
+        ).get("data") or {}
+
+    @staticmethod
+    def prepare_budget(budget):
+        budget["tipo"] = (
+            "servico"
+            if budget.get("servicos") and not budget.get("produtos")
+            else "produto"
+        )
+        for wrapper in budget.get("produtos") or []:
+            product = wrapper.get("produto") or {}
+            if not product.get("id") and product.get("produto_id"):
+                product["id"] = product["produto_id"]
+        return budget
+
+    def append_budget_note(self, budget_id, store_id, note, user):
+        budget = self.budget(budget_id, store_id)
+        if not budget:
+            raise RuntimeError("O orçamento não foi encontrado no GestãoClick.")
+
+        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
+        entry = f"[CRM {timestamp}] {user} | {note.strip()}"
+        previous = str(budget.get("observacoes_interna") or "").strip()
+        budget["observacoes_interna"] = f"{previous}\n{entry}".strip()
+        budget = self.prepare_budget(budget)
+        return self.request(
+            f"/orcamentos/{budget_id}",
+            {"loja_id": store_id},
+            method="PUT",
+            body=budget,
+        ).get("data") or {}
 
 def deduplicar_registros(registros):
     unicos = {}
@@ -342,41 +384,6 @@ def agregar_itens_cliente(df, chave_coluna, itens_coluna):
         return itens
 
     return df.groupby(chave_coluna)[itens_coluna].apply(juntar)
-
-    def budget(self, budget_id, store_id):
-        return self.request(
-            f"/orcamentos/{budget_id}", {"loja_id": store_id}
-        ).get("data") or {}
-
-    @staticmethod
-    def prepare_budget(budget):
-        budget["tipo"] = (
-            "servico"
-            if budget.get("servicos") and not budget.get("produtos")
-            else "produto"
-        )
-        for wrapper in budget.get("produtos") or []:
-            product = wrapper.get("produto") or {}
-            if not product.get("id") and product.get("produto_id"):
-                product["id"] = product["produto_id"]
-        return budget
-
-    def append_budget_note(self, budget_id, store_id, note, user):
-        budget = self.budget(budget_id, store_id)
-        if not budget:
-            raise RuntimeError("O orçamento não foi encontrado no GestãoClick.")
-
-        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
-        entry = f"[CRM {timestamp}] {user} | {note.strip()}"
-        previous = str(budget.get("observacoes_interna") or "").strip()
-        budget["observacoes_interna"] = f"{previous}\n{entry}".strip()
-        budget = self.prepare_budget(budget)
-        return self.request(
-            f"/orcamentos/{budget_id}",
-            {"loja_id": store_id},
-            method="PUT",
-            body=budget,
-        ).get("data") or {}
 
 def credenciais_gestaoclick():
     try:
@@ -3290,6 +3297,11 @@ if modo_dados == "API GestãoClick":
         st.sidebar.caption(
             "Para não digitar sempre, salve os tokens em st.secrets['gestaoclick']."
         )
+        if (
+            str(st.session_state.get("gc_access_token", "")).strip()
+            and str(st.session_state.get("gc_secret_token", "")).strip()
+        ):
+            st.sidebar.success("Tokens manuais preenchidos. Pode conectar.")
     st.sidebar.text_input(
         "Nome de quem registra as observações",
         key="gc_usuario_nome"
