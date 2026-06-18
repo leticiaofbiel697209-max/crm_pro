@@ -241,20 +241,59 @@ def valor_numerico_simples(valor, padrao=0.0):
         return padrao
     return float(convertido.iloc[0])
 
+def primeiro_valor_campos(*fontes, campos):
+    for fonte in fontes:
+        if not isinstance(fonte, dict):
+            continue
+        for campo in campos:
+            valor = fonte.get(campo)
+            if valor is not None and str(valor).strip():
+                return str(valor).strip()
+    return ""
+
+def buscar_valor_recursivo(objeto, campos):
+    if isinstance(objeto, dict):
+        for campo in campos:
+            valor = objeto.get(campo)
+            if valor is not None and str(valor).strip():
+                return str(valor).strip()
+        for valor in objeto.values():
+            encontrado = buscar_valor_recursivo(valor, campos)
+            if encontrado:
+                return encontrado
+    if isinstance(objeto, list):
+        for item in objeto:
+            encontrado = buscar_valor_recursivo(item, campos)
+            if encontrado:
+                return encontrado
+    return ""
+
 def extrair_itens_registro(registro):
     itens = []
     for campo, chave_detalhe in (("produtos", "produto"), ("servicos", "servico")):
         for wrapper in registro.get(campo) or []:
             detalhe = wrapper.get(chave_detalhe) or {}
+            campos_nome = [
+                "nome", "descricao", "descrição", "nome_produto",
+                "produto_nome", "descricao_produto", "descrição_produto",
+                "nome_servico", "nome_serviço", "servico_nome",
+                "serviço_nome", "descricao_servico", "descricao_serviço",
+                "referencia", "referência", "codigo", "código", "sku"
+            ]
             nome = (
-                detalhe.get("nome")
-                or detalhe.get("descricao")
-                or wrapper.get("nome")
-                or wrapper.get("descricao")
-                or detalhe.get("codigo")
-                or wrapper.get("codigo")
-                or "Item sem nome"
+                primeiro_valor_campos(wrapper, detalhe, campos=campos_nome)
+                or buscar_valor_recursivo(wrapper, campos_nome)
             )
+            if not nome:
+                id_item = primeiro_valor_campos(
+                    wrapper, detalhe,
+                    campos=[
+                        "produto_id", "servico_id", "serviço_id",
+                        "id_produto", "id_servico", "id_serviço", "id"
+                    ]
+                )
+                tipo = "Produto" if campo == "produtos" else "Serviço"
+                nome = f"{tipo} ID {id_item}" if id_item else "Item sem identificação"
             quantidade = (
                 wrapper.get("quantidade")
                 or detalhe.get("quantidade")
@@ -348,9 +387,21 @@ def credenciais_gestaoclick():
         access = ""
         secret = ""
 
-    access = str(st.session_state.get("gc_access_token", access)).strip()
-    secret = str(st.session_state.get("gc_secret_token", secret)).strip()
+    access_manual = str(st.session_state.get("gc_access_token", "")).strip()
+    secret_manual = str(st.session_state.get("gc_secret_token", "")).strip()
+    access = access_manual or access
+    secret = secret_manual or secret
     return access, secret
+
+def credenciais_gestaoclick_no_secrets():
+    try:
+        config = st.secrets.get("gestaoclick", {})
+        return bool(
+            str(config.get("access_token", "")).strip()
+            and str(config.get("secret_token", "")).strip()
+        )
+    except Exception:
+        return False
 
 def api_gestaoclick():
     access, secret = credenciais_gestaoclick()
@@ -3200,26 +3251,45 @@ modo_dados = st.sidebar.radio(
 if modo_dados == "API GestãoClick":
     st.sidebar.subheader("Conexão GestãoClick")
     access_padrao, secret_padrao = credenciais_gestaoclick()
+    tokens_no_secrets = credenciais_gestaoclick_no_secrets()
     if "gc_access_token" not in st.session_state:
-        st.session_state.gc_access_token = access_padrao
+        st.session_state.gc_access_token = "" if tokens_no_secrets else access_padrao
     if "gc_secret_token" not in st.session_state:
-        st.session_state.gc_secret_token = secret_padrao
+        st.session_state.gc_secret_token = "" if tokens_no_secrets else secret_padrao
     if "gc_usuario_nome" not in st.session_state:
         st.session_state.gc_usuario_nome = USUARIO_PADRAO
 
-    st.sidebar.text_input(
-        "Access token",
-        key="gc_access_token",
-        type="password"
-    )
-    st.sidebar.text_input(
-        "Secret access token",
-        key="gc_secret_token",
-        type="password"
-    )
-    st.sidebar.caption(
-        "Em produção, salve os tokens em st.secrets['gestaoclick']."
-    )
+    if tokens_no_secrets:
+        st.sidebar.success("Tokens do GestãoClick carregados pelo secrets.")
+        with st.sidebar.expander("Usar tokens manuais temporariamente"):
+            st.text_input(
+                "Access token",
+                key="gc_access_token",
+                type="password"
+            )
+            st.text_input(
+                "Secret access token",
+                key="gc_secret_token",
+                type="password"
+            )
+            st.caption(
+                "Preencha apenas se quiser substituir os tokens do secrets nesta sessão."
+            )
+    else:
+        st.sidebar.warning("Tokens do GestãoClick ainda não estão no secrets.")
+        st.sidebar.text_input(
+            "Access token",
+            key="gc_access_token",
+            type="password"
+        )
+        st.sidebar.text_input(
+            "Secret access token",
+            key="gc_secret_token",
+            type="password"
+        )
+        st.sidebar.caption(
+            "Para não digitar sempre, salve os tokens em st.secrets['gestaoclick']."
+        )
     st.sidebar.text_input(
         "Nome de quem registra as observações",
         key="gc_usuario_nome"
