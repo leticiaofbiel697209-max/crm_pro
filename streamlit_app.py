@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from html import escape
+import base64
 import json
 import re
 import time
@@ -427,6 +428,18 @@ def fmt_html(v):
 
 def html_seguro(v):
     return escape(str(v), quote=True)
+
+def link_download_bytes(rotulo, conteudo, nome_arquivo, mime):
+    if isinstance(conteudo, str):
+        conteudo = conteudo.encode("utf-8")
+    b64 = base64.b64encode(conteudo).decode("ascii")
+    return (
+        f'<a href="data:{mime};base64,{b64}" download="{html_seguro(nome_arquivo)}" '
+        'style="display:inline-block;background:#ff4b4b;color:white;'
+        'padding:0.55rem 0.9rem;border-radius:0.5rem;'
+        'text-decoration:none;font-weight:600;">'
+        f'{html_seguro(rotulo)}</a>'
+    )
 
 def norm(x):
     return str(x).strip().lower().replace("º", "o").replace("°", "o")
@@ -3240,11 +3253,15 @@ Recomendação: <b>{acao_html}</b>
             financeiro, contas_pagar, recebido_mes, pago_mes
         )
         if pdf:
-            st.download_button(
-                "📄 Baixar Relatório Executivo em PDF",
-                pdf,
-                file_name=f"Relatorio_Comercial_Executivo_{datetime.now():%d_%m_%Y}.pdf",
-                mime="application/pdf"
+            nome_pdf = f"Relatorio_Comercial_Executivo_{datetime.now():%d_%m_%Y}.pdf"
+            st.markdown(
+                link_download_bytes(
+                    "📄 Baixar Relatório Executivo em PDF",
+                    pdf,
+                    nome_pdf,
+                    "application/pdf",
+                ),
+                unsafe_allow_html=True
             )
         else:
             st.warning("PDF indisponível. Verifique se 'reportlab' está no requirements.txt.")
