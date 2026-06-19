@@ -1300,6 +1300,201 @@ def calcular_churn_avancado(dados):
         "clientes": clientes,
     }
 
+def variacao_percentual(atual, anterior):
+    if anterior in (0, None) or pd.isna(anterior):
+        return None
+    return (atual - anterior) / anterior * 100
+
+def texto_variacao(valor):
+    if valor is None or pd.isna(valor):
+        return "Sem base anterior"
+    sinal = "+" if valor >= 0 else ""
+    return f"{sinal}{valor:.1f}%"
+
+def classificar_cliente_retencao(row):
+    intervalo = float(row.get("intervalo", 0) or 0)
+    dias = float(row.get("dias_sem_comprar", 0) or 0)
+    if intervalo <= 0:
+        return "SAUDÁVEL"
+    if dias > intervalo * 2:
+        return "CHURN"
+    if dias > intervalo:
+        return "EM RISCO"
+    return "SAUDÁVEL"
+
+def classificar_status_em_data(datas, referencia):
+    datas = pd.to_datetime(datas, errors="coerce").dropna().sort_values()
+    datas = datas[datas <= referencia]
+    if datas.empty:
+        return None
+    if len(datas) < 2:
+        return "SAUDÁVEL"
+    intervalo = datas.diff().dt.days.dropna().mean()
+    if intervalo <= 0:
+        return "SAUDÁVEL"
+    dias_sem_comprar = (referencia - datas.max()).days
+    if dias_sem_comprar > intervalo * 2:
+        return "CHURN"
+    if dias_sem_comprar > intervalo:
+        return "EM RISCO"
+    return "SAUDÁVEL"
+
+@st.cache_data(show_spinner=False)
+def calcular_indicadores_retencao_ceo(
+    clientes, vendas, periodo_inicio, periodo_fim,
+    custo_comercial, custo_marketing, custo_ferramentas
+):
+    vazio = {
+        "clientes": pd.DataFrame(),
+        "contagem_status": {"SAUDÁVEL": 0, "EM RISCO": 0, "CHURN": 0},
+        "churn_financeiro_mensal": 0.0,
+        "churn_financeiro_anual": 0.0,
+        "carteira_risco_mensal": 0.0,
+        "qtd_risco": 0,
+        "potencial_recuperavel_mensal": 0.0,
+        "potencial_recuperavel_anual": 0.0,
+        "qtd_recuperaveis": 0,
+        "cac_atual": 0.0,
+        "cac_anterior": 0.0,
+        "cac_variacao": None,
+        "novos_clientes_atual": 0,
+        "novos_clientes_anterior": 0,
+        "taxa_recuperacao": 0.0,
+        "historico": pd.DataFrame(),
+    }
+    if clientes is None or clientes.empty:
+        return vazio
+
+    clientes_calc = clientes.copy()
+    clientes_calc["status_retencao"] = clientes_calc.apply(
+        classificar_cliente_retencao, axis=1
+    )
+    contagem = clientes_calc["status_retencao"].value_counts().to_dict()
+    for status in ("SAUDÁVEL", "EM RISCO", "CHURN"):
+        contagem.setdefault(status, 0)
+
+    churn = clientes_calc[clientes_calc["status_retencao"] == "CHURN"]
+    risco = clientes_calc[clientes_calc["status_retencao"] == "EM RISCO"]
+    recuperaveis = clientes_calc[
+        clientes_calc["status_retencao"].isin(["EM RISCO", "CHURN"])
+    ]
+    churn_fin_mensal = float(churn["potencial_mensal"].sum())
+    risco_mensal = float(risco["potencial_mensal"].sum())
+    recuperavel_mensal = float(recuperaveis["potencial_mensal"].sum())
+
+    total_custos = (
+        float(custo_comercial or 0)
+        + float(custo_marketing or 0)
+        + float(custo_ferramentas or 0)
+    )
+    vendas_calc = vendas.copy() if vendas is not None else pd.DataFrame()
+    historico = pd.DataFrame()
+    cac_atual = 0.0
+    cac_anterior = 0.0
+    novos_atual = 0
+    novos_anterior = 0
+    taxa_recuperacao = 0.0
+
+    if not vendas_calc.empty:
+        data_col = achar_coluna(vendas_calc, ["data"])
+        valor_col = achar_coluna(vendas_calc, ["valor"])
+        chave_col = "_cliente_chave" if "_cliente_chave" in vendas_calc.columns else achar_coluna(vendas_calc, ["cliente id", "cliente"])
+        if data_col and valor_col and chave_col:
+            vendas_calc[data_col] = pd.to_datetime(vendas_calc[data_col], errors="coerce")
+            vendas_calc[valor_col] = pd.to_numeric(vendas_calc[valor_col], errors="coerce").fillna(0)
+            vendas_calc = vendas_calc.dropna(subset=[data_col]).copy()
+            if not vendas_calc.empty:
+                vendas_calc["_mes"] = vendas_calc[data_col].dt.to_period("M")
+                primeiro_mes = vendas_calc.groupby(chave_col)[data_col].min().dt.to_period("M")
+                meses = sorted(vendas_calc["_mes"].dropna().unique())
+                linhas = []
+                for mes in meses:
+                    inicio_mes = mes.to_timestamp()
+                    fim_mes = inicio_mes + pd.offsets.MonthEnd(0)
+                    novos = int((primeiro_mes == mes).sum())
+                    cac_mes = total_custos / novos if novos else 0.0
+                    status_ref = {}
+                    potencial_ref = {}
+                    for cliente_id, grupo in vendas_calc.groupby(chave_col):
+                        datas = grupo[data_col]
+                        status = classificar_status_em_data(datas, fim_mes)
+                        if status is None:
+                            continue
+                        status_ref[cliente_id] = status
+                        ultimos_3m = grupo[
+                            (grupo[data_col] >= fim_mes - pd.DateOffset(months=3))
+                            & (grupo[data_col] <= fim_mes)
+                        ]
+                        potencial_ref[cliente_id] = float(ultimos_3m[valor_col].sum()) / 3
+                    churn_mes = sum(
+                        potencial_ref.get(cliente_id, 0.0)
+                        for cliente_id, status in status_ref.items()
+                        if status == "CHURN"
+                    )
+                    risco_mes = sum(
+                        potencial_ref.get(cliente_id, 0.0)
+                        for cliente_id, status in status_ref.items()
+                        if status == "EM RISCO"
+                    )
+                    saudaveis = sum(1 for status in status_ref.values() if status == "SAUDÁVEL")
+                    em_risco = sum(1 for status in status_ref.values() if status == "EM RISCO")
+                    churn_qtd = sum(1 for status in status_ref.values() if status == "CHURN")
+
+                    mes_anterior = mes - 1
+                    fim_anterior = mes_anterior.to_timestamp() + pd.offsets.MonthEnd(0)
+                    risco_anterior = set()
+                    for cliente_id, grupo in vendas_calc.groupby(chave_col):
+                        status_ant = classificar_status_em_data(grupo[data_col], fim_anterior)
+                        if status_ant == "EM RISCO":
+                            risco_anterior.add(cliente_id)
+                    compras_mes = set(vendas_calc.loc[vendas_calc["_mes"] == mes, chave_col])
+                    recuperados = len(risco_anterior & compras_mes)
+                    taxa_mes = recuperados / len(risco_anterior) * 100 if risco_anterior else 0.0
+
+                    linhas.append({
+                        "Mês": mes.strftime("%m/%Y"),
+                        "_mes": mes,
+                        "CAC": cac_mes,
+                        "Novos clientes": novos,
+                        "Churn financeiro": churn_mes,
+                        "Carteira em risco": risco_mes,
+                        "Saudáveis": saudaveis,
+                        "Em risco": em_risco,
+                        "Churn": churn_qtd,
+                        "Clientes em risco anterior": len(risco_anterior),
+                        "Clientes recuperados": recuperados,
+                        "Taxa de recuperação": taxa_mes,
+                    })
+                historico = pd.DataFrame(linhas)
+                if not historico.empty:
+                    atual = historico.iloc[-1]
+                    anterior = historico.iloc[-2] if len(historico) > 1 else None
+                    cac_atual = float(atual["CAC"])
+                    novos_atual = int(atual["Novos clientes"])
+                    taxa_recuperacao = float(atual["Taxa de recuperação"])
+                    if anterior is not None:
+                        cac_anterior = float(anterior["CAC"])
+                        novos_anterior = int(anterior["Novos clientes"])
+
+    return {
+        "clientes": clientes_calc,
+        "contagem_status": contagem,
+        "churn_financeiro_mensal": churn_fin_mensal,
+        "churn_financeiro_anual": churn_fin_mensal * 12,
+        "carteira_risco_mensal": risco_mensal,
+        "qtd_risco": int(len(risco)),
+        "potencial_recuperavel_mensal": recuperavel_mensal,
+        "potencial_recuperavel_anual": recuperavel_mensal * 12,
+        "qtd_recuperaveis": int(len(recuperaveis)),
+        "cac_atual": cac_atual,
+        "cac_anterior": cac_anterior,
+        "cac_variacao": variacao_percentual(cac_atual, cac_anterior),
+        "novos_clientes_atual": novos_atual,
+        "novos_clientes_anterior": novos_anterior,
+        "taxa_recuperacao": taxa_recuperacao,
+        "historico": historico,
+    }
+
 def processar_dataframes(vendas, orc, contas):
     hoje = datetime.now()
 
@@ -2840,6 +3035,119 @@ def renderizar_qualidade_dados(dados):
         })
         st.dataframe(tabela_ativos, use_container_width=True, hide_index=True)
 
+def renderizar_card_metric(coluna, titulo, valor, detalhe="", ajuda=None):
+    coluna.metric(titulo, valor, detalhe, help=ajuda)
+
+def renderizar_retencao_crescimento_ceo(
+    indicadores, clientes, prioridade
+):
+    st.markdown("---")
+    st.subheader("RETENÇÃO E CRESCIMENTO")
+    contagem = indicadores["contagem_status"]
+    historico = indicadores["historico"]
+    receita_prevista = float(clientes["faturamento"].sum())
+    venda_possivel = float(prioridade["ticket_medio"].sum())
+
+    linha1 = st.columns(4)
+    renderizar_card_metric(
+        linha1[0], "💰 Receita Prevista", fmt(receita_prevista),
+        ajuda="Faturamento total do período carregado no sistema."
+    )
+    renderizar_card_metric(
+        linha1[1], "🎯 Venda Possível Hoje", fmt(venda_possivel),
+        ajuda="Soma do ticket médio dos clientes na prioridade comercial de hoje."
+    )
+    renderizar_card_metric(
+        linha1[2], "⚠️ Carteira em Risco",
+        fmt(indicadores["carteira_risco_mensal"]),
+        f"{indicadores['qtd_risco']} clientes",
+        "Receita que pode ser perdida caso clientes em risco não sejam trabalhados."
+    )
+    renderizar_card_metric(
+        linha1[3], "🔄 Potencial Recuperável",
+        fmt(indicadores["potencial_recuperavel_mensal"]),
+        f"{indicadores['qtd_recuperaveis']} clientes",
+        "Receita que pode voltar para a empresa através da recuperação da carteira."
+    )
+
+    linha2 = st.columns(4)
+    renderizar_card_metric(
+        linha2[0], "🚨 Churn Financeiro",
+        fmt(indicadores["churn_financeiro_mensal"]),
+        f"Anual: {fmt(indicadores['churn_financeiro_anual'])}",
+        "Receita potencial perdida por clientes que deixaram de comprar."
+    )
+    renderizar_card_metric(
+        linha2[1], "👥 Clientes em Risco",
+        int(contagem.get("EM RISCO", 0)),
+        ajuda="Clientes que passaram do ciclo médio de compra, mas ainda não chegaram a 2x o ciclo."
+    )
+    renderizar_card_metric(
+        linha2[2], "❌ Clientes Perdidos",
+        int(contagem.get("CHURN", 0)),
+        ajuda="Clientes há mais de duas vezes o ciclo médio de recompra sem comprar."
+    )
+    cac_valor = (
+        fmt(indicadores["cac_atual"])
+        if indicadores["novos_clientes_atual"] else "Sem novos clientes"
+    )
+    renderizar_card_metric(
+        linha2[3], "💵 CAC Atual", cac_valor,
+        texto_variacao(indicadores["cac_variacao"]),
+        "Quanto custa adquirir um novo cliente."
+    )
+
+    st.caption(
+        f"CAC anterior: {fmt(indicadores['cac_anterior'])} | "
+        f"Novos clientes no mês atual: {indicadores['novos_clientes_atual']} | "
+        f"Novos clientes no mês anterior: {indicadores['novos_clientes_anterior']}"
+    )
+
+    st.markdown("#### Clientes Perdidos")
+    col_status = st.columns(3)
+    col_status[0].metric("Saudáveis", int(contagem.get("SAUDÁVEL", 0)))
+    col_status[1].metric("Em risco", int(contagem.get("EM RISCO", 0)))
+    col_status[2].metric("Churn", int(contagem.get("CHURN", 0)))
+
+    st.markdown("#### Taxa de Recuperação")
+    st.metric(
+        "Clientes recuperados / clientes marcados como em risco",
+        f"{indicadores['taxa_recuperacao']:.1f}%",
+        help="Clientes que estavam em risco no mês anterior e voltaram a comprar no mês atual."
+    )
+
+    if historico.empty:
+        st.info("Ainda não há histórico mensal suficiente para os gráficos executivos.")
+        return
+
+    grafico = historico.set_index("Mês")
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        st.markdown("#### Evolução do Churn Financeiro")
+        st.line_chart(grafico[["Churn financeiro"]])
+    with col_g2:
+        st.markdown("#### Evolução da Carteira em Risco")
+        st.line_chart(grafico[["Carteira em risco"]])
+
+    col_g3, col_g4 = st.columns(2)
+    with col_g3:
+        st.markdown("#### Evolução do CAC")
+        st.line_chart(grafico[["CAC"]])
+    with col_g4:
+        st.markdown("#### Clientes por Status")
+        status_df = pd.DataFrame({
+            "Status": ["Saudáveis", "Em risco", "Churn"],
+            "Clientes": [
+                int(contagem.get("SAUDÁVEL", 0)),
+                int(contagem.get("EM RISCO", 0)),
+                int(contagem.get("CHURN", 0)),
+            ]
+        }).set_index("Status")
+        st.bar_chart(status_df)
+
+    st.markdown("#### Histórico da Taxa de Recuperação")
+    st.line_chart(grafico[["Taxa de recuperação"]])
+
 def renderizar():
     dados = st.session_state.dados_processados
     orc_aberto = dados["orc_aberto"]
@@ -2864,6 +3172,16 @@ def renderizar():
     taxa_churn, qtd_churn, base_churn = calcular_churn(clientes)
     clientes_churn = listar_clientes_churn(clientes)
     churn_avancado = calcular_churn_avancado(dados)
+    configuracao = dados.get("configuracao", {})
+    indicadores_retencao = calcular_indicadores_retencao_ceo(
+        clientes,
+        dados.get("vendas_validas", pd.DataFrame()),
+        dados.get("periodo_inicio"),
+        dados.get("periodo_fim"),
+        float(configuracao.get("custo_comercial_mensal", 0)),
+        float(configuracao.get("custo_marketing_mensal", 0)),
+        float(configuracao.get("custo_ferramentas_mensal", 0)),
+    )
 
     if dados.get("origem") == "api":
         atualizado = dados.get("atualizado_em")
@@ -2926,6 +3244,9 @@ def renderizar():
         st.markdown(f"**Potencial recuperável:** **{fmt(clientes['potencial_recuperavel'].sum())}**")
         st.caption("Soma do potencial mensal dos clientes classificados como ATRASADO NA RECOMPRA ou CLIENTE INATIVO.")
         st.markdown(f"**Inadimplência real:** **{fmt(clientes['inadimplencia'].sum())}**")
+        renderizar_retencao_crescimento_ceo(
+            indicadores_retencao, clientes, prioridade
+        )
 
     with aba_financeiro:
         renderizar_financeiro_ceo(
@@ -3393,6 +3714,27 @@ if modo_dados == "API GestãoClick":
                 step=1000.0
             )
             st.session_state.meta_geral = meta_geral
+            custo_comercial_mensal = st.number_input(
+                "Custo mensal da equipe comercial",
+                min_value=0.0,
+                value=float(st.session_state.get("custo_comercial_mensal", 0.0)),
+                step=500.0
+            )
+            custo_marketing_mensal = st.number_input(
+                "Custo mensal de marketing",
+                min_value=0.0,
+                value=float(st.session_state.get("custo_marketing_mensal", 0.0)),
+                step=500.0
+            )
+            custo_ferramentas_mensal = st.number_input(
+                "Custo mensal de ferramentas comerciais",
+                min_value=0.0,
+                value=float(st.session_state.get("custo_ferramentas_mensal", 0.0)),
+                step=100.0
+            )
+            st.session_state.custo_comercial_mensal = custo_comercial_mensal
+            st.session_state.custo_marketing_mensal = custo_marketing_mensal
+            st.session_state.custo_ferramentas_mensal = custo_ferramentas_mensal
             vendedor_nome_config = vendedor.get("nome") or "Todos"
             if vendedor_nome_config != "Todos":
                 meta_vendedor = st.number_input(
@@ -3465,6 +3807,9 @@ if modo_dados == "API GestãoClick":
                             "folha_mensal": folha_mensal,
                             "despesas_fixas": despesas_fixas,
                             "outras_despesas": outras_despesas,
+                            "custo_comercial_mensal": custo_comercial_mensal,
+                            "custo_marketing_mensal": custo_marketing_mensal,
+                            "custo_ferramentas_mensal": custo_ferramentas_mensal,
                         }
                     )
                 st.success("Dados atualizados pelo GestãoClick.")
@@ -3480,6 +3825,32 @@ else:
     orc_file = st.sidebar.file_uploader("Relatório de Orçamentos", type=["xlsx"])
     contas_file = st.sidebar.file_uploader("Contas a Receber", type=["xlsx"])
 
+    with st.sidebar.expander("Premissas CAC"):
+        custo_comercial_excel = st.number_input(
+            "Custo mensal da equipe comercial",
+            min_value=0.0,
+            value=float(st.session_state.get("custo_comercial_mensal", 0.0)),
+            step=500.0,
+            key="custo_comercial_excel"
+        )
+        custo_marketing_excel = st.number_input(
+            "Custo mensal de marketing",
+            min_value=0.0,
+            value=float(st.session_state.get("custo_marketing_mensal", 0.0)),
+            step=500.0,
+            key="custo_marketing_excel"
+        )
+        custo_ferramentas_excel = st.number_input(
+            "Custo mensal de ferramentas comerciais",
+            min_value=0.0,
+            value=float(st.session_state.get("custo_ferramentas_mensal", 0.0)),
+            step=100.0,
+            key="custo_ferramentas_excel"
+        )
+        st.session_state.custo_comercial_mensal = custo_comercial_excel
+        st.session_state.custo_marketing_mensal = custo_marketing_excel
+        st.session_state.custo_ferramentas_mensal = custo_ferramentas_excel
+
     if st.sidebar.button("Analisar arquivos", type="primary"):
         if not vendas_file or not orc_file or not contas_file:
             st.error("Envie os três arquivos.")
@@ -3492,6 +3863,11 @@ else:
             st.session_state.dados_processados = processar_dados(
                 vendas_file, orc_file, contas_file
             )
+            st.session_state.dados_processados["configuracao"] = {
+                "custo_comercial_mensal": custo_comercial_excel,
+                "custo_marketing_mensal": custo_marketing_excel,
+                "custo_ferramentas_mensal": custo_ferramentas_excel,
+            }
         except Exception as e:
             st.error(f"Erro ao processar: {e}")
 
