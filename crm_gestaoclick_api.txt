@@ -311,6 +311,16 @@ def buscar_valor_recursivo(objeto, campos):
                 return encontrado
     return ""
 
+def documento_cliente_registro(registro):
+    campos = [
+        "cpf_cnpj", "cpfcnpj", "cnpj", "cpf", "documento",
+        "cliente_cpf_cnpj", "cnpj_cliente", "cpf_cliente"
+    ]
+    return (
+        primeiro_valor_campos(registro, campos=campos)
+        or buscar_valor_recursivo(registro, campos)
+    )
+
 def extrair_itens_registro(registro):
     itens = []
     for campo, chave_detalhe in (("produtos", "produto"), ("servicos", "servico")):
@@ -1506,6 +1516,7 @@ def processar_dataframes(vendas, orc, contas):
     cv_status = achar_coluna(vendas, ["situacao", "status"])
     cv_vendedor = achar_coluna(vendas, ["vendedor"])
     cv_vendedor_id = achar_coluna(vendas, ["vendedor id"])
+    cv_documento = achar_coluna(vendas, ["documento", "cnpj", "cpf"])
     cv_item = achar_coluna(vendas, ["produto", "servico", "serviço", "item", "descricao", "descrição"])
     co_num = achar_coluna(orc, ["nº", "n°", "numero", "número"])
     co_cli = achar_coluna(orc, ["cliente"])
@@ -1630,6 +1641,12 @@ def processar_dataframes(vendas, orc, contas):
         ).fillna("")
     else:
         clientes["Vendedor ID"] = ""
+    if cv_documento:
+        clientes["Documento"] = clientes["Cliente ID"].map(
+            vendas_recentes[cv_documento]
+        ).fillna("")
+    else:
+        clientes["Documento"] = ""
 
     intervalo = vendas.sort_values(cv_data).groupby("_cliente_chave")[cv_data].apply(
         lambda x: x.diff().mean().days if len(x.dropna()) > 1 else 0
@@ -1664,7 +1681,7 @@ def processar_dataframes(vendas, orc, contas):
         )
     ]
     orc_aberto = orc_aberto[
-        orc_aberto[co_data] >= (hoje - pd.Timedelta(days=30))
+        orc_aberto[co_data] >= (hoje - pd.Timedelta(days=90))
     ].copy()
 
     orc_aberto["dias_no_sistema"] = (hoje - orc_aberto[co_data]).dt.days
@@ -1791,6 +1808,7 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
     vendas = pd.DataFrame([{
         "Cliente": item.get("nome_cliente") or "Cliente sem nome",
         "Cliente ID": item.get("cliente_id"),
+        "Documento": documento_cliente_registro(item),
         "Data": pd.to_datetime(item.get("data"), format="%Y-%m-%d", errors="coerce"),
         "Valor": item.get("valor_total") or 0,
         "Custo": custo_total_venda(item),
@@ -1807,6 +1825,7 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
         "Numero": item.get("codigo") or item.get("id"),
         "Cliente": item.get("nome_cliente") or "Cliente sem nome",
         "Cliente ID": item.get("cliente_id"),
+        "Documento": documento_cliente_registro(item),
         "Data": pd.to_datetime(item.get("data"), format="%Y-%m-%d", errors="coerce"),
         "Situacao": item.get("nome_situacao") or "",
         "Valor": item.get("valor_total") or 0,
@@ -1819,6 +1838,7 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
     contas = pd.DataFrame([{
         "Cliente": item.get("nome_cliente") or "Cliente sem nome",
         "Cliente ID": item.get("cliente_id"),
+        "Documento": documento_cliente_registro(item),
         "Vencimento": pd.to_datetime(
             item.get("data_vencimento"), format="%Y-%m-%d", errors="coerce"
         ),
@@ -1834,17 +1854,17 @@ def api_para_dataframes(vendas_api, orcamentos_api, recebimentos_api, vendedor_i
     if vendas.empty:
         vendas = pd.DataFrame(columns=[
             "Cliente", "Cliente ID", "Data", "Valor", "Custo", "Situacao",
-            "Vendedor", "Vendedor ID", "_itens_texto", "_venda_id"
+            "Vendedor", "Vendedor ID", "Documento", "_itens_texto", "_venda_id"
         ])
     if orcamentos.empty:
         orcamentos = pd.DataFrame(columns=[
-            "Numero", "Cliente", "Cliente ID", "Data", "Situacao", "Valor", "Vendedor",
+            "Numero", "Cliente", "Cliente ID", "Documento", "Data", "Situacao", "Valor", "Vendedor",
             "Observacoes", "Observacoes internas",
             "_itens_texto", "_orcamento_id", "_observacoes_interna"
         ])
     if contas.empty:
         contas = pd.DataFrame(columns=[
-            "Cliente", "Cliente ID", "Vencimento", "Valor Total", "Situacao", "Juros",
+            "Cliente", "Cliente ID", "Documento", "Vencimento", "Valor Total", "Situacao", "Juros",
             "Desconto", "Forma Pagamento", "Loja", "_recebimento_id"
         ])
     return vendas, orcamentos, contas
@@ -2218,6 +2238,110 @@ def data_retorno_cliente(cliente_id, cliente):
             datas.append(data_retorno)
     return min(datas) if datas else pd.NaT
 
+def nome_item_resumo(texto):
+    texto = str(texto or "").strip()
+    if not texto:
+        return ""
+    return texto.split(" | ")[0].strip()
+
+def montar_ofertas_recompra(dados, vendedor="Todas"):
+    clientes = dados.get("clientes", pd.DataFrame()).copy()
+    vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    if clientes.empty or vendas.empty:
+        return pd.DataFrame()
+
+    data_col = achar_coluna(vendas, ["data"])
+    vendedor_col = achar_coluna(clientes, ["vendedor"])
+    if not data_col or "_itens_texto" not in vendas.columns:
+        return pd.DataFrame()
+
+    if vendedor and vendedor != "Todas" and vendedor_col:
+        clientes = clientes[clientes[vendedor_col].astype(str).str.strip() == vendedor].copy()
+    if clientes.empty:
+        return pd.DataFrame()
+
+    mapa_clientes = clientes.set_index("Cliente ID").to_dict("index")
+    hoje = pd.Timestamp(date.today())
+    linhas = []
+    vendas = vendas.dropna(subset=[data_col]).copy()
+    for cliente_id, grupo_cliente in vendas.groupby("_cliente_chave"):
+        info = mapa_clientes.get(cliente_id)
+        if not info:
+            continue
+        cliente = str(info.get("Cliente", "Cliente sem nome"))
+        if contato_realizado_hoje(cliente_id, cliente):
+            continue
+
+        intervalo_cliente = int(info.get("intervalo", 0) or 0)
+        if intervalo_cliente <= 0:
+            continue
+
+        itens = []
+        for _, venda in grupo_cliente.sort_values(data_col).iterrows():
+            lista_itens = venda.get("_itens_texto", [])
+            if not isinstance(lista_itens, list):
+                lista_itens = [lista_itens] if str(lista_itens).strip() else []
+            for item in lista_itens:
+                nome_item = nome_item_resumo(item)
+                if nome_item:
+                    itens.append({
+                        "item": nome_item,
+                        "data": pd.to_datetime(venda[data_col], errors="coerce"),
+                        "valor": float(venda.get(achar_coluna(vendas, ["valor"]), 0) or 0),
+                    })
+        if not itens:
+            itens_comprados = info.get("itens_comprados", [])
+            if isinstance(itens_comprados, list) and itens_comprados:
+                itens.append({
+                    "item": nome_item_resumo(itens_comprados[0]),
+                    "data": pd.to_datetime(info.get("ultima_compra"), errors="coerce"),
+                    "valor": float(info.get("ticket_medio", 0) or 0),
+                })
+        if not itens:
+            continue
+
+        itens_df = pd.DataFrame(itens).dropna(subset=["data"])
+        if itens_df.empty:
+            continue
+        melhor = None
+        for item, grupo_item in itens_df.groupby("item"):
+            datas = grupo_item["data"].sort_values()
+            intervalo_item = int(datas.diff().mean().days) if len(datas) > 1 else intervalo_cliente
+            if intervalo_item <= 0:
+                intervalo_item = intervalo_cliente
+            ultima = datas.max()
+            dias_sem = int((hoje - ultima.normalize()).days)
+            if dias_sem < max(1, int(intervalo_item * 0.8)):
+                continue
+            prioridade = dias_sem - intervalo_item
+            candidato = {
+                "Cliente": cliente,
+                "Cliente ID": cliente_id,
+                "Documento": info.get("Documento", ""),
+                "Vendedor": info.get("Vendedor", "Sem vendedor"),
+                "Produto": item,
+                "Intervalo": intervalo_item,
+                "Dias sem comprar": dias_sem,
+                "Última compra": ultima.strftime("%d/%m/%Y"),
+                "Ticket médio": float(info.get("ticket_medio", 0) or 0),
+                "Oferta": (
+                    f"{cliente} compra {item} a cada {intervalo_item} dias "
+                    f"e está há {dias_sem} dias sem comprar. Ligar oferecendo {item}."
+                ),
+                "_prioridade": prioridade,
+            }
+            if melhor is None or candidato["_prioridade"] > melhor["_prioridade"]:
+                melhor = candidato
+        if melhor:
+            linhas.append(melhor)
+
+    ofertas = pd.DataFrame(linhas)
+    if not ofertas.empty:
+        ofertas = ofertas.sort_values(
+            ["_prioridade", "Ticket médio"], ascending=[False, False]
+        )
+    return ofertas
+
 def montar_resumo_diario_oportunidades(dados, vendedor="Todas"):
     orcamentos = dados.get("orcamentos_todos", pd.DataFrame()).copy()
     vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
@@ -2245,7 +2369,7 @@ def montar_resumo_diario_oportunidades(dados, vendedor="Todas"):
     orcamentos = orcamentos.dropna(subset=[co_data]).copy()
     orcamentos = orcamentos[orcamentos[co_status].apply(status_aberto_resumo_diario)].copy()
     orcamentos = orcamentos[
-        orcamentos[co_data] >= hoje - pd.Timedelta(days=30)
+        orcamentos[co_data] >= hoje - pd.Timedelta(days=90)
     ].copy()
 
     if co_vendedor:
@@ -2367,7 +2491,266 @@ def montar_resumo_diario_oportunidades(dados, vendedor="Todas"):
         )
     return oportunidades, counters
 
+def renderizar_botao_liguei_resumo(cliente_id, cliente, vendedor, oferta, chave):
+    observacao_padrao = (
+        f"Contato feito em {date.today():%d/%m/%Y} oferecendo: {oferta}"
+        if oferta else ""
+    )
+    observacao = st.text_area(
+        "Anotação para salvar no CRM",
+        value=observacao_padrao,
+        key=f"resumo_diario_anotacao_{chave}",
+    )
+    if st.button(
+        "Já Liguei",
+        key=f"resumo_diario_liguei_{chave}",
+        type="primary",
+        use_container_width=True,
+    ):
+        try:
+            salvar_contato_realizado(
+                cliente_id, cliente, vendedor, observacao, "resumo_diario"
+            )
+            st.success("Contato registrado e anotação salva no CRM.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Não foi possível registrar o contato: {e}")
+
+def renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave):
+    with st.expander("Agendar retorno"):
+        data_retorno = st.date_input(
+            "Data do retorno",
+            value=date.today() + timedelta(days=1),
+            min_value=date.today(),
+            key=f"resumo_diario_data_retorno_{chave}"
+        )
+        motivo = st.text_input(
+            "Motivo",
+            value="Retorno comercial",
+            key=f"resumo_diario_motivo_{chave}"
+        )
+        observacao_retorno = st.text_area(
+            "Observação do retorno",
+            key=f"resumo_diario_obs_retorno_{chave}"
+        )
+        if st.button(
+            "Salvar retorno",
+            key=f"resumo_diario_agendar_{chave}",
+            use_container_width=True,
+        ):
+            try:
+                agendar_retorno_cliente(
+                    cliente_id, cliente, vendedor, data_retorno,
+                    motivo, observacao_retorno,
+                )
+                st.success(f"Retorno agendado para {data_retorno:%d/%m/%Y}.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível agendar o retorno: {e}")
+
+def renderizar_card_resumo(row, indice, modo="prioridade"):
+    cliente = str(row.get("Cliente", "Cliente sem nome"))
+    vendedor = str(row.get("Vendedor", "Sem vendedor"))
+    cliente_id = str(row.get("_cliente_id", row.get("Cliente ID", "")))
+    valor = row.get("Valor", row.get("Ticket médio", 0))
+    oferta = str(row.get("Oferta", row.get("Motivo", "")))
+    chave = chave_widget(
+        f"resumo_{modo}_{row.get('_budget_id', '')}_{cliente_id}_{cliente}_{indice}"
+    )
+
+    st.markdown(
+        f"""
+<div style="background:white;padding:14px;border-radius:10px;border:1px solid #ddd;margin-bottom:8px;">
+<b>{html_seguro(cliente)}</b><br>
+Vendedor: <b>{html_seguro(vendedor)}</b><br>
+Valor/ticket: <b>{fmt_html(valor)}</b><br>
+{html_seguro(oferta)}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    renderizar_botao_liguei_resumo(cliente_id, cliente, vendedor, oferta, chave)
+    renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave)
+
+def renderizar_grid_resumo(df, modo):
+    if df.empty:
+        st.info("Nenhum cliente encontrado para esta visão.")
+        return
+    linhas = list(df.head(30).iterrows())
+    for i in range(0, len(linhas), 3):
+        cols = st.columns(3)
+        for j, (indice, row) in enumerate(linhas[i:i+3]):
+            with cols[j]:
+                renderizar_card_resumo(row, indice, modo)
+
+def renderizar_busca_cliente_produtos(dados, vendedor="Todas"):
+    clientes = dados.get("clientes", pd.DataFrame()).copy()
+    if clientes.empty:
+        st.info("Base de clientes ainda não carregada.")
+        return
+    vendedor_col = achar_coluna(clientes, ["vendedor"])
+    if vendedor and vendedor != "Todas" and vendedor_col:
+        clientes = clientes[clientes[vendedor_col].astype(str).str.strip() == vendedor].copy()
+
+    termo = st.text_input(
+        "Buscar cliente por nome, CNPJ/documento ou ID",
+        key="resumo_diario_busca_cliente"
+    )
+    if not termo.strip():
+        st.caption("Digite parte do nome, CNPJ/documento ou ID do cliente.")
+        return
+
+    termo_norm = norm(termo)
+    documento_col = achar_coluna(clientes, ["documento", "cnpj", "cpf"])
+    mascara = (
+        clientes["Cliente"].astype(str).map(norm).str.contains(termo_norm, na=False, regex=False) |
+        clientes["Cliente ID"].astype(str).map(norm).str.contains(termo_norm, na=False, regex=False)
+    )
+    if documento_col:
+        mascara = mascara | clientes[documento_col].astype(str).map(norm).str.contains(
+            termo_norm, na=False, regex=False
+        )
+    encontrados = clientes[mascara].head(12)
+    if encontrados.empty:
+        st.warning("Nenhum cliente encontrado.")
+        return
+
+    for i in range(0, len(encontrados), 3):
+        cols = st.columns(3)
+        for j, (_, r) in enumerate(encontrados.iloc[i:i+3].iterrows()):
+            with cols[j]:
+                st.markdown(
+                    f"""
+<div style="background:white;padding:14px;border-radius:10px;border:1px solid #ddd;margin-bottom:8px;">
+<b>{html_seguro(r['Cliente'])}</b><br>
+Documento: <b>{html_seguro(r.get('Documento', ''))}</b><br>
+Vendedor: <b>{html_seguro(r.get('Vendedor', 'Sem vendedor'))}</b><br>
+Compra a cada <b>{int(r.get('intervalo', 0) or 0)} dias</b><br>
+Dias sem comprar: <b>{int(r.get('dias_sem_comprar', 0) or 0)}</b>
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
+                with st.expander("Produtos comprados e orçados"):
+                    renderizar_lista_itens("Itens comprados", r.get("itens_comprados", []))
+                    renderizar_lista_itens("Itens orçados", r.get("itens_orcados", []))
+
 def renderizar_resumo_diario(dados):
+    st.subheader("Resumo Diário")
+    st.caption("Gestão diária dos orçamentos, ofertas de recompra e prioridades das vendedoras.")
+    orcamentos = dados.get("orcamentos_todos", pd.DataFrame())
+    clientes = dados.get("clientes", pd.DataFrame())
+    if orcamentos.empty and clientes.empty:
+        st.info("Carregue os dados da API para montar o resumo diário.")
+        return
+
+    base_vendedores = orcamentos if not orcamentos.empty else clientes
+    vendedor_col = achar_coluna(base_vendedores, ["vendedor"])
+    vendedores = ["Todas"]
+    if vendedor_col:
+        vendedores += sorted(
+            nome for nome in base_vendedores[vendedor_col].dropna().astype(str).str.strip().unique()
+            if nome and nome.lower() not in {"nan", "none"}
+        )
+
+    vendedor = st.selectbox("Vendedor", vendedores, key="resumo_diario_vendedor")
+    oportunidades, counters = montar_resumo_diario_oportunidades(dados, vendedor)
+    ofertas = montar_ofertas_recompra(dados, vendedor)
+
+    cols = st.columns(5)
+    cols[0].metric("Ligações hoje", counters["calls"] + len(ofertas))
+    cols[1].metric("Oportunidades quentes", counters["hot"])
+    cols[2].metric("Retornos hoje", counters["returns"])
+    cols[3].metric("Sem contato", counters["untouched"])
+    cols[4].metric("Vencendo", counters["expiring"])
+
+    secao = st.radio(
+        "Resumo Diário",
+        [
+            "Fila de prioridades",
+            "Ofertas de recompra",
+            "Buscar cliente/produtos",
+            "Ações rápidas",
+            "Visão de gestão",
+        ],
+        horizontal=True,
+        key="resumo_diario_secao",
+        label_visibility="collapsed",
+    )
+
+    if secao == "Fila de prioridades":
+        st.markdown("#### Fila de prioridades")
+        filtro = st.radio(
+            "Mostrar",
+            ["Todas", "Oportunidades quentes", "Retornos hoje"],
+            horizontal=True,
+            key="resumo_diario_filtro"
+        )
+        exibicao = oportunidades.copy()
+        if not exibicao.empty and filtro == "Oportunidades quentes":
+            exibicao = exibicao[exibicao["Categoria"] == "QUENTE"]
+        elif not exibicao.empty and filtro == "Retornos hoje":
+            exibicao = exibicao[exibicao["Categoria"] == "RETORNO"]
+        renderizar_grid_resumo(exibicao, "fila")
+
+    if secao == "Ofertas de recompra":
+        st.markdown("#### Ofertas de recompra")
+        st.caption(
+            "Sugestões geradas a partir do ciclo real de compra: produto, intervalo e dias sem comprar."
+        )
+        renderizar_grid_resumo(ofertas, "oferta")
+
+    if secao == "Buscar cliente/produtos":
+        st.markdown("#### Buscar cliente e produtos")
+        renderizar_busca_cliente_produtos(dados, vendedor)
+
+    if secao == "Ações rápidas":
+        st.markdown("#### Ações rápidas")
+        combinada = pd.concat(
+            [oportunidades.head(15), ofertas.head(15)],
+            ignore_index=True,
+            sort=False,
+        )
+        renderizar_grid_resumo(combinada, "acoes")
+
+    if secao == "Visão de gestão":
+        st.markdown("#### Desempenho por vendedor")
+        if oportunidades.empty and ofertas.empty:
+            st.info("Nenhuma prioridade encontrada para gestão.")
+            return
+        if oportunidades.empty:
+            gestao = pd.DataFrame(columns=[
+                "Vendedor", "Prioridades", "Ligações", "Quentes", "Retornos", "Valor"
+            ])
+        else:
+            gestao = oportunidades.groupby("Vendedor").agg(
+                Prioridades=("Cliente", "count"),
+                Ligações=("Categoria", lambda s: int(s.isin(["RETORNO", "SEM CONTATO", "VENCENDO"]).sum())),
+                Quentes=("Categoria", lambda s: int((s == "QUENTE").sum())),
+                Retornos=("Categoria", lambda s: int((s == "RETORNO").sum())),
+                Valor=("Valor", "sum"),
+            ).reset_index()
+        if not ofertas.empty:
+            ofertas_gestao = ofertas.groupby("Vendedor").agg(
+                Ofertas=("Cliente", "count"),
+                Ticket=("Ticket médio", "sum"),
+            ).reset_index()
+            gestao = gestao.merge(ofertas_gestao, on="Vendedor", how="outer").fillna(0)
+        if "Ofertas" not in gestao.columns:
+            gestao["Ofertas"] = 0
+        if "Ticket" not in gestao.columns:
+            gestao["Ticket"] = 0
+        if "Valor" not in gestao.columns:
+            gestao["Valor"] = 0
+        gestao["Valor"] = gestao["Valor"] + gestao["Ticket"]
+        gestao["Valor"] = gestao["Valor"].map(fmt)
+        st.dataframe(
+            gestao.drop(columns=["Ticket"], errors="ignore"),
+            use_container_width=True,
+            hide_index=True,
+        )
+    return
+
     st.subheader("Resumo Diário")
     st.caption("Gestão diária dos orçamentos e prioridades das vendedoras.")
     orcamentos = dados.get("orcamentos_todos", pd.DataFrame())
@@ -4038,9 +4421,9 @@ if modo_dados == "API GestãoClick":
         )
 
         fim_padrao = date.today()
-        inicio_padrao = fim_padrao - timedelta(days=365)
+        inicio_padrao = fim_padrao - timedelta(days=90)
         inicio_api = st.sidebar.date_input(
-            "Vendas desde",
+            "Vendas e orçamentos desde",
             value=inicio_padrao,
             max_value=fim_padrao
         )
@@ -4051,7 +4434,8 @@ if modo_dados == "API GestãoClick":
             max_value=fim_padrao
         )
         st.sidebar.caption(
-            "Para churn, recomenda-se analisar pelo menos 12 meses de vendas."
+            "Padrão comercial: últimos 90 dias para ganhar velocidade. "
+            "A visão financeira permanece separada e considera os dados financeiros disponíveis."
         )
 
         with st.sidebar.expander("Metas e premissas financeiras"):
