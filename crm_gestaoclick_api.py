@@ -2475,7 +2475,8 @@ def montar_resumo_diario_oportunidades(dados, vendedor="Todas"):
             sinais.append("cliente recorrente")
         if ja_ligou:
             sinais.append("contato hoje")
-        if score >= 65 and len(sinais) >= 2 and idade <= 14:
+        oportunidade_quente = score >= 65 and len(sinais) >= 2 and idade <= 14
+        if oportunidade_quente:
             categorias.append((90, "QUENTE", "Oportunidade: " + ", ".join(sinais[:3]), "Priorizar"))
             counters["hot"] += 1
 
@@ -2504,12 +2505,14 @@ def montar_resumo_diario_oportunidades(dados, vendedor="Todas"):
             "Último contato": "Hoje" if ja_ligou else f"{idade} dias sem contato",
             "Motivo": motivo,
             "Ação": acao,
+            "_oportunidade_quente": oportunidade_quente,
             "_prioridade": prioridade,
             "_budget_id": str(row.get("_orcamento_id", "") or row.get(co_num, "")),
             "_cliente_id": cliente_id,
         })
     oportunidades = pd.DataFrame(linhas)
     if not oportunidades.empty:
+        counters["hot"] = int(oportunidades["_oportunidade_quente"].sum())
         oportunidades = oportunidades.sort_values(
             ["_prioridade", "Score", "Valor", "Cliente"],
             ascending=[False, False, False, True]
@@ -2573,6 +2576,55 @@ def renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave):
             except Exception as e:
                 st.error(f"Não foi possível agendar o retorno: {e}")
 
+def texto_email_resumo(cliente, vendedor, oferta):
+    assunto = f"Novaprint | {cliente}"
+    corpo = (
+        f"Olá, tudo bem?\n\n"
+        f"Aqui é {vendedor}, da Novaprint.\n\n"
+        f"Estou entrando em contato porque identifiquei uma oportunidade importante:\n"
+        f"{oferta}\n\n"
+        f"Posso te ajudar com essa reposição ou com uma nova proposta?\n\n"
+        f"Fico à disposição.\n\n"
+        f"{vendedor}\n"
+        f"Novaprint"
+    )
+    return assunto, corpo
+
+def renderizar_email_resumo(cliente, vendedor, oferta, chave):
+    with st.expander("Preparar e-mail"):
+        st.caption(
+            "Este modo cria o rascunho. Para enviar automaticamente saindo do e-mail da vendedora, "
+            "precisaremos cadastrar as credenciais/OAuth de cada conta."
+        )
+        destinatario = st.text_input(
+            "E-mail do cliente",
+            key=f"email_destino_resumo_{chave}"
+        )
+        assunto_padrao, corpo_padrao = texto_email_resumo(cliente, vendedor, oferta)
+        assunto = st.text_input(
+            "Assunto",
+            value=assunto_padrao,
+            key=f"email_assunto_resumo_{chave}"
+        )
+        corpo = st.text_area(
+            "Mensagem",
+            value=corpo_padrao,
+            height=220,
+            key=f"email_corpo_resumo_{chave}"
+        )
+        if destinatario.strip():
+            link = (
+                "mailto:"
+                + urllib.parse.quote(destinatario.strip())
+                + "?subject="
+                + urllib.parse.quote(assunto)
+                + "&body="
+                + urllib.parse.quote(corpo)
+            )
+            st.markdown(f"[Abrir rascunho no e-mail]({link})")
+        else:
+            st.caption("Informe o e-mail do cliente para gerar o rascunho.")
+
 def renderizar_card_resumo(row, indice, modo="prioridade"):
     cliente = str(row.get("Cliente", "Cliente sem nome"))
     vendedor = str(row.get("Vendedor", "Sem vendedor"))
@@ -2595,6 +2647,7 @@ Valor/ticket: <b>{fmt_html(valor)}</b><br>
         unsafe_allow_html=True,
     )
     renderizar_botao_liguei_resumo(cliente_id, cliente, vendedor, oferta, chave)
+    renderizar_email_resumo(cliente, vendedor, oferta, chave)
     renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave)
 
 def renderizar_grid_resumo(df, modo):
@@ -2745,31 +2798,34 @@ def renderizar_resumo_diario(dados):
     if "resumo_diario_secao" not in st.session_state:
         st.session_state.resumo_diario_secao = "Início"
 
-    nav_cols = st.columns(5)
-    if nav_cols[0].button("Início", use_container_width=True):
-        st.session_state.resumo_diario_secao = "Início"
-        st.rerun()
-    if nav_cols[1].button("Fila de prioridades", use_container_width=True):
-        st.session_state.resumo_diario_secao = "Fila de prioridades"
-        st.rerun()
-    if nav_cols[2].button("Buscar clientes", use_container_width=True):
-        st.session_state.resumo_diario_secao = "Buscar cliente/produtos"
-        st.rerun()
-    if nav_cols[3].button("Ações rápidas", use_container_width=True):
-        st.session_state.resumo_diario_secao = "Ações rápidas"
-        st.rerun()
-    if nav_cols[4].button("Visão de gestão", use_container_width=True):
-        st.session_state.resumo_diario_secao = "Visão de gestão"
-        st.rerun()
+    menu_resumo, conteudo_resumo = st.columns([1, 4])
+    with menu_resumo:
+        if st.button("Início", use_container_width=True):
+            st.session_state.resumo_diario_secao = "Início"
+            st.rerun()
+        if st.button("Fila de prioridades", use_container_width=True):
+            st.session_state.resumo_diario_secao = "Fila de prioridades"
+            st.rerun()
+        if st.button("Buscar clientes", use_container_width=True):
+            st.session_state.resumo_diario_secao = "Buscar cliente/produtos"
+            st.rerun()
+        if st.button("Ações rápidas", use_container_width=True):
+            st.session_state.resumo_diario_secao = "Ações rápidas"
+            st.rerun()
+        if st.button("Visão de gestão", use_container_width=True):
+            st.session_state.resumo_diario_secao = "Visão de gestão"
+            st.rerun()
 
     secao = st.session_state.resumo_diario_secao
 
-    if secao == "Início":
-        st.markdown("#### Ofertas de recompra para hoje")
-        st.caption(
-            "Essas ofertas vêm do ciclo real de compra do cliente e aparecem já na entrada do Resumo Diário."
-        )
-        renderizar_grid_resumo(ofertas, "inicio_oferta")
+    with conteudo_resumo:
+
+        if secao == "Início":
+            st.markdown("#### Ofertas de recompra para hoje")
+            st.caption(
+                "Essas ofertas vêm do ciclo real de compra do cliente e aparecem já na entrada do Resumo Diário."
+            )
+            renderizar_grid_resumo(ofertas, "inicio_oferta")
 
     if secao == "Fila de prioridades":
         st.markdown("#### Fila de prioridades")
@@ -2781,7 +2837,7 @@ def renderizar_resumo_diario(dados):
         )
         exibicao = oportunidades.copy()
         if not exibicao.empty and filtro == "Oportunidades quentes":
-            exibicao = exibicao[exibicao["Categoria"] == "QUENTE"]
+            exibicao = exibicao[exibicao["_oportunidade_quente"]]
         elif not exibicao.empty and filtro == "Retornos hoje":
             exibicao = exibicao[exibicao["Categoria"] == "RETORNO"]
         renderizar_grid_resumo(exibicao, "fila")
@@ -2819,7 +2875,7 @@ def renderizar_resumo_diario(dados):
             gestao = oportunidades.groupby("Vendedor").agg(
                 Prioridades=("Cliente", "count"),
                 Ligações=("Categoria", lambda s: int(s.isin(["RETORNO", "SEM CONTATO", "VENCENDO"]).sum())),
-                Quentes=("Categoria", lambda s: int((s == "QUENTE").sum())),
+                Quentes=("_oportunidade_quente", "sum"),
                 Retornos=("Categoria", lambda s: int((s == "RETORNO").sum())),
                 Valor=("Valor", "sum"),
             ).reset_index()
