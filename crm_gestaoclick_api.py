@@ -191,6 +191,39 @@ class GestaoClickAPI:
             "data_fim": end_date.isoformat(),
         })
 
+    def budget_statuses(self, store_id):
+        return self.list_all("/situacoes_orcamentos", {"loja_id": store_id})
+
+    def products(self, store_id, search_text="", code=""):
+        params = {"loja_id": store_id, "ativo": 1}
+        if str(code or "").strip():
+            params["codigo"] = str(code).strip()
+        elif str(search_text or "").strip():
+            params["nome"] = str(search_text).strip()
+        return self.list_all("/produtos", params)
+
+    def create_budget(self, payload, store_id):
+        payload = dict(payload)
+        payload["loja_id"] = int(store_id)
+        return self.request(
+            "/orcamentos",
+            {"loja_id": store_id},
+            method="POST",
+            body=payload,
+        ).get("data") or {}
+
+    def find_budget_by_code(self, budget_code, store_id):
+        data = self.list_all("/orcamentos", {
+            "tipo": "produto",
+            "codigo": budget_code,
+            "loja_id": store_id,
+        })
+        exact = [
+            budget for budget in data
+            if str(budget.get("codigo") or "").strip() == str(budget_code).strip()
+        ]
+        return exact[0] if exact else None
+
     def open_receivables(self, store_id):
         records = []
         seen = set()
@@ -2245,6 +2278,153 @@ def renderizar_lista_itens(titulo, itens):
     if len(itens) > 30:
         st.caption(f"Mostrando 30 de {len(itens)} itens encontrados.")
 
+def parse_itens_orcamento_colados(texto):
+    itens = []
+    for linha_num, linha in enumerate(str(texto or "").splitlines(), start=1):
+        linha = linha.strip()
+        if not linha:
+            continue
+        separador = ";" if ";" in linha else "\t"
+        partes = [parte.strip() for parte in linha.split(separador)]
+        if linha_num == 1 and {norm(p) for p in partes} & {"produto", "quantidade", "qtd"}:
+            continue
+        if len(partes) >= 3:
+            produto, quantidade_raw, valor_raw = partes[:3]
+        elif len(partes) == 2:
+            produto, quantidade_raw = partes
+            valor_raw = ""
+        else:
+            produto = partes[0]
+            quantidade_raw = "1"
+            valor_raw = ""
+        if not produto:
+            raise ValueError(f"Linha {linha_num}: informe o nome do produto.")
+        quantidade = valor_numerico_simples(quantidade_raw, 0)
+        if quantidade <= 0:
+            raise ValueError(f"Linha {linha_num}: quantidade deve ser maior que zero.")
+        valor = valor_numerico_simples(valor_raw, 0)
+        itens.append({
+            "produto": produto,
+            "quantidade": quantidade,
+            "valor": valor,
+            "linha": linha_num,
+        })
+    if not itens:
+        raise ValueError("Cole ao menos um produto no formato Produto;Quantidade.")
+    return itens
+
+def ultimo_preco_produto_cliente(dados, cliente_id, produto_nome):
+    vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    if vendas.empty:
+        return 0.0, None
+    data_col = achar_coluna(vendas, ["data"])
+    valor_col = achar_coluna(vendas, ["valor"])
+    if not data_col or not valor_col or "_itens_texto" not in vendas.columns:
+        return 0.0, None
+    base = vendas[vendas["_cliente_chave"].astype(str) == str(cliente_id)].copy()
+    if base.empty:
+        return 0.0, None
+    produto_norm = norm(produto_nome)
+    candidatos = []
+    for _, venda in base.sort_values(data_col, ascending=False).iterrows():
+        itens = venda.get("_itens_texto", [])
+        if not isinstance(itens, list):
+            itens = [itens] if str(itens).strip() else []
+        if any(produto_norm in norm(nome_item_resumo(item)) for item in itens):
+            candidatos.append(venda)
+    if not candidatos:
+        return 0.0, None
+    venda = candidatos[0]
+    return float(venda.get(valor_col, 0) or 0), pd.to_datetime(venda.get(data_col), errors="coerce")
+
+def produto_payload_orcamento(api, loja_id, nome_produto, quantidade, valor, detalhes):
+    produtos = []
+    try:
+        produtos = api.products(loja_id, nome_produto)
+    except Exception:
+        produtos = []
+    produto = produtos[0] if produtos else {}
+    product_id = produto.get("id")
+    product_name = produto.get("nome") or nome_produto
+    variation_id = None
+    variacoes = produto.get("variacoes") or []
+    if len(variacoes) == 1:
+        variation_id = (variacoes[0].get("variacao") or {}).get("id")
+    return {
+        "produto": {
+            "id": product_id,
+            "nome_produto": product_name,
+            "variacao_id": variation_id,
+            "detalhes": detalhes,
+            "quantidade": str(quantidade),
+            "valor_venda": str(valor),
+            "tipo_desconto": "R$",
+            "desconto_valor": "0",
+            "desconto_porcentagem": "0",
+        }
+    }
+
+def situacao_inicial_orcamento(api, loja_id):
+    situacoes = api.budget_statuses(loja_id)
+    return next(
+        (
+            s for s in situacoes
+            if str(s.get("nome", "")).strip().lower() in {"em aberto", "aberto"}
+        ),
+        situacoes[0] if situacoes else None,
+    )
+
+def criar_orcamento_gestaoclick_api(
+    dados, cliente_id, vendedor_id, itens, codigo=None, observacao_extra=""
+):
+    loja_id = dados.get("loja_id")
+    if not loja_id:
+        raise RuntimeError("Loja não identificada. Atualize os dados pela API.")
+    api = api_gestaoclick()
+    situacao = situacao_inicial_orcamento(api, loja_id)
+    if not situacao:
+        raise RuntimeError("Não foi possível localizar uma situação inicial para orçamento.")
+    produtos = []
+    for item in itens:
+        data_preco = item.get("data_preco")
+        data_txt = data_preco.strftime("%d/%m/%Y") if pd.notna(data_preco) else "data não identificada"
+        detalhes = (
+            item.get("detalhes")
+            or f"Preço sugerido com base na última venda em {data_txt}."
+        )
+        produtos.append(
+            produto_payload_orcamento(
+                api,
+                loja_id,
+                item["produto"],
+                item["quantidade"],
+                item["valor"],
+                detalhes,
+            )
+        )
+    payload = {
+        "tipo": "produto",
+        "cliente_id": int(cliente_id),
+        "situacao_id": int(situacao["id"]),
+        "data": date.today().isoformat(),
+        "validade": "10 dias",
+        "condicao_pagamento": "a_vista",
+        "valor_frete": 0,
+        "produtos": produtos,
+        "observacoes_interna": observacao_extra,
+    }
+    if codigo:
+        existente = api.find_budget_by_code(codigo, loja_id)
+        if existente:
+            raise RuntimeError(f"O orçamento {codigo} já existe no GestãoClick.")
+        payload["codigo"] = int(codigo)
+    if vendedor_id:
+        payload["vendedor_id"] = int(vendedor_id)
+    criado = api.create_budget(payload, loja_id)
+    if not criado.get("id"):
+        raise RuntimeError("O GestãoClick não retornou o ID do orçamento criado.")
+    return api.budget(criado["id"], loja_id)
+
 def status_aberto_resumo_diario(status):
     bloqueados = (
         "APROVADO|CANCELADO|CONFIRMADO|CONCRETIZADO|CONVERTIDO|"
@@ -2339,16 +2519,23 @@ def montar_ofertas_recompra(dados, vendedor="Todas"):
             if dias_sem < max(1, int(intervalo_item * 0.8)):
                 continue
             prioridade = dias_sem - intervalo_item
+            ultimo_valor, ultima_data_preco = ultimo_preco_produto_cliente(
+                dados, cliente_id, item
+            )
             candidato = {
                 "Cliente": cliente,
                 "Cliente ID": cliente_id,
                 "Documento": info.get("Documento", ""),
                 "Vendedor": info.get("Vendedor", "Sem vendedor"),
+                "Vendedor ID": info.get("Vendedor ID", ""),
                 "Produto": item,
                 "Intervalo": intervalo_item,
                 "Dias sem comprar": dias_sem,
                 "Última compra": ultima.strftime("%d/%m/%Y"),
                 "Ticket médio": float(info.get("ticket_medio", 0) or 0),
+                "_ultimo_valor_sugerido": ultimo_valor or float(info.get("ticket_medio", 0) or 0),
+                "_ultima_data_preco": ultima_data_preco,
+                "_loja_id": dados.get("loja_id", ""),
                 "Oferta": (
                     f"{cliente} compra {item} a cada {intervalo_item} dias "
                     f"e está há {dias_sem} dias sem comprar. Ligar oferecendo {item}."
@@ -2681,6 +2868,66 @@ def renderizar_email_resumo(cliente, vendedor, oferta, chave, row=None):
         else:
             st.caption("Informe o e-mail do cliente para gerar o rascunho.")
 
+def renderizar_criar_orcamento_sugerido(row, chave):
+    produto = str(row.get("Produto", "") or "").strip()
+    cliente_id = str(row.get("Cliente ID", row.get("_cliente_id", "")) or "").strip()
+    if not produto or not cliente_id:
+        return
+    with st.expander("Criar orçamento"):
+        valor_sugerido = float(row.get("_ultimo_valor_sugerido", 0) or 0)
+        data_preco = row.get("_ultima_data_preco")
+        qtd = st.number_input(
+            "Quantidade",
+            min_value=1.0,
+            value=1.0,
+            step=1.0,
+            key=f"orc_sug_qtd_{chave}",
+        )
+        valor = st.number_input(
+            "Valor sugerido",
+            min_value=0.0,
+            value=valor_sugerido,
+            step=10.0,
+            key=f"orc_sug_valor_{chave}",
+        )
+        data_txt = data_preco.strftime("%d/%m/%Y") if pd.notna(data_preco) else "data não identificada"
+        st.caption(f"Preço sugerido da última venda em {data_txt}.")
+        codigo = st.text_input(
+            "Número do orçamento (opcional)",
+            key=f"orc_sug_codigo_{chave}",
+        )
+        confirmado = st.checkbox(
+            "Revisei e autorizo criar este orçamento no GestãoClick.",
+            key=f"orc_sug_confirmar_{chave}",
+        )
+        if st.button(
+            "Criar orçamento no GestãoClick",
+            disabled=not confirmado,
+            type="primary",
+            use_container_width=True,
+            key=f"orc_sug_criar_{chave}",
+        ):
+            try:
+                item = {
+                    "produto": produto,
+                    "quantidade": qtd,
+                    "valor": valor,
+                    "data_preco": data_preco,
+                    "detalhes": f"Preço sugerido da última venda em {data_txt}.",
+                }
+                criado = criar_orcamento_gestaoclick_api(
+                    st.session_state.dados_processados,
+                    cliente_id,
+                    row.get("Vendedor ID", ""),
+                    [item],
+                    codigo.strip() or None,
+                    f"Criado pelo CRM Inteligente. Produto sugerido: {produto}.",
+                )
+                numero = criado.get("codigo") or criado.get("id")
+                st.success(f"Orçamento {numero} criado no GestãoClick.")
+            except Exception as e:
+                st.error(f"Não foi possível criar o orçamento: {e}")
+
 def renderizar_card_resumo(row, indice, modo="prioridade"):
     cliente = str(row.get("Cliente", "Cliente sem nome"))
     vendedor = str(row.get("Vendedor", "Sem vendedor"))
@@ -2729,6 +2976,7 @@ Tipo de prioridade: <b>{html_seguro(categoria)}</b><br>
     )
     renderizar_botao_liguei_resumo(cliente_id, cliente, vendedor, oferta, chave)
     renderizar_email_resumo(cliente, vendedor, oferta, chave, row)
+    renderizar_criar_orcamento_sugerido(row, chave)
     renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave)
 
 def renderizar_grid_resumo(df, modo):
@@ -2846,6 +3094,125 @@ Dias sem comprar: <b>{int(r.get('dias_sem_comprar', 0) or 0)}</b>
                 with st.expander("Produtos comprados e orçados"):
                     renderizar_lista_itens("Itens comprados", r.get("itens_comprados", []))
                     renderizar_lista_itens("Itens orçados", r.get("itens_orcados", []))
+
+def renderizar_geracao_orcamentos():
+    st.subheader("Geração de Orçamentos")
+    st.caption("Crie orçamentos no GestãoClick usando o formato: Nome do produto; quantidade.")
+    dados = st.session_state.dados_processados or {}
+    if dados.get("origem") != "api" or not dados.get("loja_id"):
+        st.info("Atualize os dados pela API do GestãoClick antes de criar orçamentos.")
+        return
+
+    loja_id = dados.get("loja_id")
+    col_cliente, col_vendedor = st.columns(2)
+    termo_cliente = col_cliente.text_input(
+        "Buscar cliente por nome, CNPJ/documento ou ID",
+        key="gerar_orc_busca_cliente",
+    )
+    usuarios = [
+        usuario for usuario in st.session_state.get("gestaoclick_usuarios", [])
+        if str(usuario.get("id") or "").strip()
+    ]
+    vendedor = col_vendedor.selectbox(
+        "Vendedor",
+        [{"id": "", "nome": "Sem vendedor"}, *usuarios],
+        format_func=lambda item: item.get("nome") or "Sem vendedor",
+        key="gerar_orc_vendedor",
+    )
+
+    clientes_api = []
+    if termo_cliente.strip():
+        cache_key = f"{loja_id}|orc|{termo_cliente.strip().lower()}"
+        if "clientes_api_cache" not in st.session_state:
+            st.session_state.clientes_api_cache = {}
+        if cache_key not in st.session_state.clientes_api_cache:
+            try:
+                with st.spinner("Buscando cliente no GestãoClick..."):
+                    st.session_state.clientes_api_cache[cache_key] = api_gestaoclick().clients(
+                        loja_id, termo_cliente.strip()
+                    )
+            except Exception as e:
+                st.warning(f"Não foi possível buscar clientes na API: {e}")
+                st.session_state.clientes_api_cache[cache_key] = []
+        clientes_api = st.session_state.clientes_api_cache.get(cache_key, [])
+
+    cliente_escolhido = None
+    if clientes_api:
+        cliente_escolhido = st.selectbox(
+            "Cliente encontrado",
+            clientes_api,
+            format_func=lambda c: (
+                c.get("nome") or c.get("nome_fantasia") or c.get("razao_social") or f"Cliente {c.get('id')}"
+            ),
+            key="gerar_orc_cliente",
+        )
+    elif termo_cliente.strip():
+        st.warning("Nenhum cliente encontrado para esse termo.")
+
+    texto_itens = st.text_area(
+        "Produtos",
+        placeholder="Exemplo:\nAdesivo vinil brilho; 10\nBanner 90x120; 2",
+        height=180,
+        key="gerar_orc_itens",
+    )
+    st.caption("Use uma linha por item: Nome do produto; quantidade. Opcionalmente: Nome; quantidade; valor.")
+
+    itens = []
+    if texto_itens.strip():
+        try:
+            itens = parse_itens_orcamento_colados(texto_itens)
+            st.success(f"{len(itens)} item(ns) identificado(s).")
+            preview = pd.DataFrame(itens)[["produto", "quantidade", "valor"]]
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(str(e))
+
+    codigo = st.text_input("Número do orçamento (opcional)", key="gerar_orc_codigo")
+    confirmado = st.checkbox(
+        "Revisei cliente, vendedor e produtos. Autorizo criar o orçamento no GestãoClick.",
+        key="gerar_orc_confirmar",
+    )
+    if st.button(
+        "Criar orçamento no GestãoClick",
+        type="primary",
+        disabled=not confirmado,
+        key="gerar_orc_criar",
+    ):
+        if not cliente_escolhido:
+            st.error("Selecione um cliente.")
+            return
+        if not itens:
+            st.error("Informe ao menos um produto.")
+            return
+        try:
+            itens_final = []
+            cliente_id = str(cliente_escolhido.get("id") or cliente_escolhido.get("cliente_id") or "")
+            for item in itens:
+                valor = item["valor"]
+                data_preco = None
+                if valor <= 0:
+                    valor, data_preco = ultimo_preco_produto_cliente(
+                        dados, cliente_id, item["produto"]
+                    )
+                data_txt = data_preco.strftime("%d/%m/%Y") if pd.notna(data_preco) else "data não identificada"
+                itens_final.append({
+                    **item,
+                    "valor": valor,
+                    "data_preco": data_preco,
+                    "detalhes": f"Preço sugerido da última venda em {data_txt}.",
+                })
+            criado = criar_orcamento_gestaoclick_api(
+                dados,
+                cliente_id,
+                vendedor.get("id") or "",
+                itens_final,
+                codigo.strip() or None,
+                "Criado pelo módulo Geração de Orçamentos do CRM Inteligente.",
+            )
+            numero = criado.get("codigo") or criado.get("id")
+            st.success(f"Orçamento {numero} criado no GestãoClick.")
+        except Exception as e:
+            st.error(f"Não foi possível criar o orçamento: {e}")
 
 def renderizar_resumo_diario(dados):
     st.subheader("Resumo Diário")
@@ -4117,6 +4484,9 @@ def renderizar():
     if pagina == "Resumo Diário":
         renderizar_resumo_diario(dados)
 
+    if pagina == "Geração de Orçamentos":
+        renderizar_geracao_orcamentos()
+
     if pagina == "👑 CEO":
         st.subheader("👑 Painel CEO")
 
@@ -4521,9 +4891,11 @@ if "pagina_atual_crm" not in st.session_state:
     st.session_state.pagina_atual_crm = "👑 CEO"
 if "abrir_resumo_diario" not in st.session_state:
     st.session_state.abrir_resumo_diario = False
+if "abrir_geracao_orcamentos" not in st.session_state:
+    st.session_state.abrir_geracao_orcamentos = False
 if "resumo_diario_secao" not in st.session_state:
     st.session_state.resumo_diario_secao = "Início"
-opcoes_paginas_crm = opcoes_menu_crm + ["Resumo Diário"]
+opcoes_paginas_crm = opcoes_menu_crm + ["Resumo Diário", "Geração de Orçamentos"]
 if st.session_state.pagina_atual_crm not in opcoes_paginas_crm:
     st.session_state.pagina_atual_crm = "👑 CEO"
 
@@ -4544,9 +4916,10 @@ with st.sidebar.expander("📊 CRM Inteligente", expanded=True):
         st.session_state.menu_lateral_crm_anterior = pagina_selecionada
     elif pagina_selecionada != radio_anterior:
         st.session_state.abrir_resumo_diario = False
+        st.session_state.abrir_geracao_orcamentos = False
         st.session_state.pagina_atual_crm = pagina_selecionada
         st.session_state.menu_lateral_crm_anterior = pagina_selecionada
-    elif not st.session_state.abrir_resumo_diario:
+    elif not st.session_state.abrir_resumo_diario and not st.session_state.abrir_geracao_orcamentos:
         st.session_state.pagina_atual_crm = pagina_selecionada
 
 with st.sidebar.expander("Resumo Diário", expanded=False):
@@ -4577,7 +4950,16 @@ with st.sidebar.expander("Resumo Diário", expanded=False):
     if st.button("Abrir Resumo Diário", use_container_width=True):
         st.session_state.resumo_diario_secao = secao_resumo_lateral
         st.session_state.abrir_resumo_diario = True
+        st.session_state.abrir_geracao_orcamentos = False
         st.session_state.pagina_atual_crm = "Resumo Diário"
+        st.rerun()
+
+with st.sidebar.expander("Geração de Orçamentos", expanded=False):
+    st.caption("Criar orçamento via API do GestãoClick.")
+    if st.button("Abrir Geração de Orçamentos", use_container_width=True):
+        st.session_state.abrir_geracao_orcamentos = True
+        st.session_state.abrir_resumo_diario = False
+        st.session_state.pagina_atual_crm = "Geração de Orçamentos"
         st.rerun()
 
 pagina = st.session_state.pagina_atual_crm
