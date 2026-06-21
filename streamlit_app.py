@@ -149,6 +149,31 @@ class GestaoClickAPI:
     def users(self, store_id):
         return self.list_all("/usuarios", {"loja_id": store_id})
 
+    def clients(self, store_id, search_text=""):
+        search_text = str(search_text or "").strip()
+        tentativas = []
+        base = {"loja_id": store_id}
+        if search_text:
+            tentativas = [
+                {**base, "nome": search_text},
+                {**base, "busca": search_text},
+                {**base, "cpf_cnpj": search_text},
+                {**base, "documento": search_text},
+            ]
+        else:
+            tentativas = [base]
+        ultimo_erro = None
+        for params in tentativas:
+            try:
+                registros = self.list_all("/clientes", params)
+                if registros:
+                    return registros
+            except Exception as exc:
+                ultimo_erro = exc
+        if ultimo_erro:
+            raise ultimo_erro
+        return []
+
     def sales(self, start_date, end_date, store_id):
         return self.list_all("/vendas", {
             "loja_id": store_id,
@@ -2585,11 +2610,8 @@ def renderizar_grid_resumo(df, modo):
 
 def renderizar_busca_cliente_produtos(dados, vendedor="Todas"):
     clientes = dados.get("clientes", pd.DataFrame()).copy()
-    if clientes.empty:
-        st.info("Base de clientes ainda não carregada.")
-        return
     vendedor_col = achar_coluna(clientes, ["vendedor"])
-    if vendedor and vendedor != "Todas" and vendedor_col:
+    if not clientes.empty and vendedor and vendedor != "Todas" and vendedor_col:
         clientes = clientes[clientes[vendedor_col].astype(str).str.strip() == vendedor].copy()
 
     termo = st.text_input(
@@ -2600,29 +2622,85 @@ def renderizar_busca_cliente_produtos(dados, vendedor="Todas"):
         st.caption("Digite parte do nome, CNPJ/documento ou ID do cliente.")
         return
 
+    encontrados = pd.DataFrame()
     termo_norm = norm(termo)
-    documento_col = achar_coluna(clientes, ["documento", "cnpj", "cpf"])
-    mascara = (
-        clientes["Cliente"].astype(str).map(norm).str.contains(termo_norm, na=False, regex=False) |
-        clientes["Cliente ID"].astype(str).map(norm).str.contains(termo_norm, na=False, regex=False)
-    )
-    if documento_col:
-        mascara = mascara | clientes[documento_col].astype(str).map(norm).str.contains(
-            termo_norm, na=False, regex=False
+    if not clientes.empty:
+        documento_col = achar_coluna(clientes, ["documento", "cnpj", "cpf"])
+        mascara = (
+            clientes["Cliente"].astype(str).map(norm).str.contains(termo_norm, na=False, regex=False) |
+            clientes["Cliente ID"].astype(str).map(norm).str.contains(termo_norm, na=False, regex=False)
         )
-    encontrados = clientes[mascara].head(12)
+        if documento_col:
+            mascara = mascara | clientes[documento_col].astype(str).map(norm).str.contains(
+                termo_norm, na=False, regex=False
+            )
+        encontrados = clientes[mascara].copy()
+
+    encontrados_api = []
+    if dados.get("origem") == "api" and len(termo.strip()) >= 2:
+        loja_id = dados.get("loja_id")
+        cache_key = f"{loja_id}|{termo.strip().lower()}"
+        if "clientes_api_cache" not in st.session_state:
+            st.session_state.clientes_api_cache = {}
+        if cache_key not in st.session_state.clientes_api_cache:
+            try:
+                with st.spinner("Buscando cliente no GestãoClick..."):
+                    st.session_state.clientes_api_cache[cache_key] = api_gestaoclick().clients(
+                        loja_id, termo.strip()
+                    )
+            except Exception as e:
+                st.warning(f"Não foi possível buscar clientes na API: {e}")
+                st.session_state.clientes_api_cache[cache_key] = []
+        encontrados_api = st.session_state.clientes_api_cache.get(cache_key, [])
+
+    if encontrados_api:
+        linhas_api = []
+        for item in encontrados_api:
+            cliente_id = str(item.get("id") or item.get("cliente_id") or "").strip()
+            nome = (
+                item.get("nome")
+                or item.get("nome_fantasia")
+                or item.get("razao_social")
+                or item.get("nome_cliente")
+                or "Cliente sem nome"
+            )
+            linhas_api.append({
+                "Cliente": nome,
+                "Cliente ID": cliente_id,
+                "Documento": documento_cliente_registro(item),
+                "Vendedor": item.get("nome_vendedor") or "GestãoClick",
+                "intervalo": 0,
+                "dias_sem_comprar": 0,
+                "itens_comprados": [],
+                "itens_orcados": [],
+                "_origem_busca": "API GestãoClick",
+            })
+        clientes_api_df = pd.DataFrame(linhas_api)
+        if not encontrados.empty:
+            ids_locais = set(encontrados["Cliente ID"].astype(str))
+            clientes_api_df = clientes_api_df[
+                ~clientes_api_df["Cliente ID"].astype(str).isin(ids_locais)
+            ]
+        encontrados = pd.concat([encontrados, clientes_api_df], ignore_index=True, sort=False)
+
     if encontrados.empty:
         st.warning("Nenhum cliente encontrado.")
         return
 
+    st.caption(
+        "A busca considera a base carregada do CRM e consulta o GestãoClick pela API quando conectado."
+    )
+    encontrados = encontrados.head(18)
     for i in range(0, len(encontrados), 3):
         cols = st.columns(3)
         for j, (_, r) in enumerate(encontrados.iloc[i:i+3].iterrows()):
             with cols[j]:
+                origem = r.get("_origem_busca", "CRM")
                 st.markdown(
                     f"""
 <div style="background:white;padding:14px;border-radius:10px;border:1px solid #ddd;margin-bottom:8px;">
 <b>{html_seguro(r['Cliente'])}</b><br>
+Origem: <b>{html_seguro(origem)}</b><br>
 Documento: <b>{html_seguro(r.get('Documento', ''))}</b><br>
 Vendedor: <b>{html_seguro(r.get('Vendedor', 'Sem vendedor'))}</b><br>
 Compra a cada <b>{int(r.get('intervalo', 0) or 0)} dias</b><br>
@@ -2664,19 +2742,34 @@ def renderizar_resumo_diario(dados):
     cols[3].metric("Sem contato", counters["untouched"])
     cols[4].metric("Vencendo", counters["expiring"])
 
-    secao = st.radio(
-        "Resumo Diário",
-        [
-            "Fila de prioridades",
-            "Ofertas de recompra",
-            "Buscar cliente/produtos",
-            "Ações rápidas",
-            "Visão de gestão",
-        ],
-        horizontal=True,
-        key="resumo_diario_secao",
-        label_visibility="collapsed",
-    )
+    if "resumo_diario_secao" not in st.session_state:
+        st.session_state.resumo_diario_secao = "Início"
+
+    nav_cols = st.columns(5)
+    if nav_cols[0].button("Início", use_container_width=True):
+        st.session_state.resumo_diario_secao = "Início"
+        st.rerun()
+    if nav_cols[1].button("Fila de prioridades", use_container_width=True):
+        st.session_state.resumo_diario_secao = "Fila de prioridades"
+        st.rerun()
+    if nav_cols[2].button("Buscar clientes", use_container_width=True):
+        st.session_state.resumo_diario_secao = "Buscar cliente/produtos"
+        st.rerun()
+    if nav_cols[3].button("Ações rápidas", use_container_width=True):
+        st.session_state.resumo_diario_secao = "Ações rápidas"
+        st.rerun()
+    if nav_cols[4].button("Visão de gestão", use_container_width=True):
+        st.session_state.resumo_diario_secao = "Visão de gestão"
+        st.rerun()
+
+    secao = st.session_state.resumo_diario_secao
+
+    if secao == "Início":
+        st.markdown("#### Ofertas de recompra para hoje")
+        st.caption(
+            "Essas ofertas vêm do ciclo real de compra do cliente e aparecem já na entrada do Resumo Diário."
+        )
+        renderizar_grid_resumo(ofertas, "inicio_oferta")
 
     if secao == "Fila de prioridades":
         st.markdown("#### Fila de prioridades")
