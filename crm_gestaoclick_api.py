@@ -2582,29 +2582,65 @@ def texto_email_resumo(cliente, vendedor, oferta, row=None):
     orcamento = str(row.get("Orçamento", "") or "").strip()
     categoria = str(row.get("Categoria", "") or "").strip()
     motivo = str(row.get("Motivo", oferta) or oferta)
-    acao = str(row.get("Ação", "") or "").strip()
     valor = row.get("Valor", row.get("Ticket médio", 0))
-    assunto = f"Novaprint | {cliente}"
-    contexto = []
-    if produto:
-        contexto.append(f"Produto sugerido: {produto}")
+    intervalo = row.get("Intervalo", "")
+    dias = row.get("Dias sem comprar", row.get("Idade", ""))
+    valor_txt = fmt(valor) if valor else ""
+    intervalo_num = valor_numerico_simples(intervalo, 0)
+    dias_num = valor_numerico_simples(dias, 0)
+
     if orcamento:
-        contexto.append(f"Orçamento em acompanhamento: {orcamento}")
-    if categoria:
-        contexto.append(f"Prioridade no CRM: {categoria}")
-    if valor:
-        contexto.append(f"Valor/ticket de referência: {fmt(valor)}")
-    if acao:
-        contexto.append(f"Ação sugerida: {acao}")
-    contexto_txt = "\n".join(f"- {linha}" for linha in contexto)
+        assunto = f"Sobre o orçamento {orcamento}"
+        detalhe_valor = f" no valor de {valor_txt}" if valor_txt else ""
+        urgencia = (
+            f"Vi que ele já está há {dias} dias em aberto, então quis te chamar antes de perdermos o timing."
+            if str(dias).strip() else
+            "Quis te chamar para ver se ficou alguma dúvida ou se posso te ajudar a seguir com ele."
+        )
+        corpo = (
+            f"Olá, tudo bem?\n\n"
+            f"Passando rapidinho para saber se conseguimos avançar com o orçamento {orcamento}{detalhe_valor}.\n\n"
+            f"{urgencia}\n\n"
+            f"Se fizer sentido para você, posso revisar algum detalhe, ajustar quantidade ou ver uma condição para fecharmos.\n\n"
+            f"Posso dar sequência por aqui?\n\n"
+            f"Abraço,\n"
+            f"{vendedor}\n"
+            f"Novaprint"
+        )
+        return assunto, corpo
+
+    if produto:
+        assunto = f"Reposição de {produto}"
+        ciclo = (
+            f"Vi aqui que vocês costumam comprar {produto} a cada {int(intervalo_num)} dias"
+            if intervalo_num > 0
+            else f"Vi aqui uma oportunidade para reposição de {produto}"
+        )
+        tempo = (
+            f" e já faz {int(dias_num)} dias desde a última compra."
+            if dias_num > 0
+            else "."
+        )
+        corpo = (
+            f"Olá, tudo bem?\n\n"
+            f"{ciclo}{tempo}\n\n"
+            f"Quer que eu já separe uma condição para reposição? "
+            f"Se quiser, também posso revisar a quantidade ideal para evitar falta ou compra maior que o necessário.\n\n"
+            f"Posso te mandar uma proposta atualizada de {produto}?\n\n"
+            f"Abraço,\n"
+            f"{vendedor}\n"
+            f"Novaprint"
+        )
+        return assunto, corpo
+
+    assunto = f"Seguimos com essa demanda?"
     corpo = (
         f"Olá, tudo bem?\n\n"
-        f"Aqui é {vendedor}, da Novaprint.\n\n"
-        f"Estou entrando em contato para dar sequência a uma oportunidade identificada no nosso atendimento.\n\n"
+        f"Passei para retomar com você esse ponto que ficou em aberto:\n\n"
         f"{motivo}\n\n"
-        f"{contexto_txt}\n\n"
-        f"Você gostaria que eu atualizasse essa proposta ou preparasse uma nova condição para você?\n\n"
-        f"Fico à disposição.\n\n"
+        f"Se ainda fizer sentido, posso te ajudar a avançar com isso hoje ou ajustar o que for necessário.\n\n"
+        f"Como prefere seguir?\n\n"
+        f"Abraço,\n"
         f"{vendedor}\n"
         f"Novaprint"
     )
