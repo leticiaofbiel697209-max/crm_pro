@@ -3581,26 +3581,57 @@ Recomendação: <b>{acao_html}</b>
         else:
             st.warning("PDF indisponível. Verifique se 'reportlab' está no requirements.txt.")
 
+opcoes_menu_crm = [
+    "👑 CEO",
+    "💰 Financeiro CEO",
+    "🎯 Gestão Comercial",
+    "📉 Churn",
+    "🔥 Prioridade",
+    "📋 Resumo",
+    "📄 Orçamentos",
+    "🧠 Gestão",
+    "✅ Qualidade",
+    "📊 Base",
+    "✉️ Resumo E-mail",
+    "📧 Relatório Comercial",
+]
+if "pagina_atual_crm" not in st.session_state:
+    st.session_state.pagina_atual_crm = "👑 CEO"
+if st.session_state.pagina_atual_crm not in opcoes_menu_crm:
+    st.session_state.pagina_atual_crm = "👑 CEO"
+
+def mudar_pagina_crm(destino):
+    st.session_state.pagina_atual_crm = destino
+    st.session_state.menu_lateral_crm = destino
+
 with st.sidebar.expander("📊 CRM Inteligente", expanded=True):
-    pagina = st.radio(
+    pagina_selecionada = st.radio(
         "Abas",
-        [
-            "👑 CEO",
-            "💰 Financeiro CEO",
-            "🎯 Gestão Comercial",
-            "📉 Churn",
-            "🔥 Prioridade",
-            "📋 Resumo",
-            "📄 Orçamentos",
-            "🧠 Gestão",
-            "✅ Qualidade",
-            "📊 Base",
-            "✉️ Resumo E-mail",
-            "📧 Relatório Comercial",
-        ],
+        opcoes_menu_crm,
+        index=opcoes_menu_crm.index(st.session_state.pagina_atual_crm),
         key="menu_lateral_crm",
         label_visibility="collapsed",
     )
+    st.session_state.pagina_atual_crm = pagina_selecionada
+
+with st.sidebar.expander("Resumo Diário", expanded=False):
+    st.caption("Gestão diária dos orçamentos e prioridades das vendedoras.")
+    atalhos_resumo_diario = [
+        ("Gestão Comercial", "🎯 Gestão Comercial"),
+        ("Prioridade", "🔥 Prioridade"),
+        ("Resumo", "📋 Resumo"),
+        ("Orçamentos", "📄 Orçamentos"),
+    ]
+    for rotulo, destino in atalhos_resumo_diario:
+        st.button(
+            rotulo,
+            key=f"atalho_resumo_diario_{chave_widget(destino)}",
+            on_click=mudar_pagina_crm,
+            args=(destino,),
+            use_container_width=True,
+        )
+
+pagina = st.session_state.pagina_atual_crm
 
 with st.sidebar.expander("Fonte dos dados", expanded=False):
     st.info("Fonte automática: API GestãoClick")
