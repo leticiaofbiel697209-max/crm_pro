@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -3600,10 +3601,6 @@ if "pagina_atual_crm" not in st.session_state:
 if st.session_state.pagina_atual_crm not in opcoes_menu_crm:
     st.session_state.pagina_atual_crm = "👑 CEO"
 
-def mudar_pagina_crm(destino):
-    st.session_state.pagina_atual_crm = destino
-    st.session_state.menu_lateral_crm = destino
-
 with st.sidebar.expander("📊 CRM Inteligente", expanded=True):
     pagina_selecionada = st.radio(
         "Abas",
@@ -3615,21 +3612,27 @@ with st.sidebar.expander("📊 CRM Inteligente", expanded=True):
     st.session_state.pagina_atual_crm = pagina_selecionada
 
 with st.sidebar.expander("Resumo Diário", expanded=False):
-    st.caption("Gestão diária dos orçamentos e prioridades das vendedoras.")
-    atalhos_resumo_diario = [
-        ("Gestão Comercial", "🎯 Gestão Comercial"),
-        ("Prioridade", "🔥 Prioridade"),
-        ("Resumo", "📋 Resumo"),
-        ("Orçamentos", "📄 Orçamentos"),
-    ]
-    for rotulo, destino in atalhos_resumo_diario:
-        st.button(
-            rotulo,
-            key=f"atalho_resumo_diario_{chave_widget(destino)}",
-            on_click=mudar_pagina_crm,
-            args=(destino,),
-            use_container_width=True,
+    st.caption("Software Gestão de Orçamentos das Vendedoras.")
+    resumo_zip = Path(__file__).with_name("Resumo-Diario-Alice.zip")
+    if resumo_zip.exists():
+        st.markdown(
+            link_download_bytes(
+                "Baixar Resumo Diário Alice",
+                resumo_zip.read_bytes(),
+                "Resumo-Diario-Alice.zip",
+                "application/zip",
+            ),
+            unsafe_allow_html=True,
         )
+    else:
+        st.warning(
+            "Arquivo Resumo-Diario-Alice.zip não encontrado junto ao app. "
+            "Suba esse ZIP no mesmo repositório do streamlit_app.py."
+        )
+    st.caption(
+        "Esse é o mesmo pacote do caminho: "
+        "ainda-usando-o-gestao-click-quero/outputs/Resumo-Diario-Alice.zip"
+    )
 
 pagina = st.session_state.pagina_atual_crm
 
