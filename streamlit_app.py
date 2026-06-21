@@ -2576,21 +2576,41 @@ def renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave):
             except Exception as e:
                 st.error(f"Não foi possível agendar o retorno: {e}")
 
-def texto_email_resumo(cliente, vendedor, oferta):
+def texto_email_resumo(cliente, vendedor, oferta, row=None):
+    row = row if row is not None else {}
+    produto = str(row.get("Produto", "") or "").strip()
+    orcamento = str(row.get("Orçamento", "") or "").strip()
+    categoria = str(row.get("Categoria", "") or "").strip()
+    motivo = str(row.get("Motivo", oferta) or oferta)
+    acao = str(row.get("Ação", "") or "").strip()
+    valor = row.get("Valor", row.get("Ticket médio", 0))
     assunto = f"Novaprint | {cliente}"
+    contexto = []
+    if produto:
+        contexto.append(f"Produto sugerido: {produto}")
+    if orcamento:
+        contexto.append(f"Orçamento em acompanhamento: {orcamento}")
+    if categoria:
+        contexto.append(f"Prioridade no CRM: {categoria}")
+    if valor:
+        contexto.append(f"Valor/ticket de referência: {fmt(valor)}")
+    if acao:
+        contexto.append(f"Ação sugerida: {acao}")
+    contexto_txt = "\n".join(f"- {linha}" for linha in contexto)
     corpo = (
         f"Olá, tudo bem?\n\n"
         f"Aqui é {vendedor}, da Novaprint.\n\n"
-        f"Estou entrando em contato porque identifiquei uma oportunidade importante:\n"
-        f"{oferta}\n\n"
-        f"Posso te ajudar com essa reposição ou com uma nova proposta?\n\n"
+        f"Estou entrando em contato para dar sequência a uma oportunidade identificada no nosso atendimento.\n\n"
+        f"{motivo}\n\n"
+        f"{contexto_txt}\n\n"
+        f"Você gostaria que eu atualizasse essa proposta ou preparasse uma nova condição para você?\n\n"
         f"Fico à disposição.\n\n"
         f"{vendedor}\n"
         f"Novaprint"
     )
     return assunto, corpo
 
-def renderizar_email_resumo(cliente, vendedor, oferta, chave):
+def renderizar_email_resumo(cliente, vendedor, oferta, chave, row=None):
     with st.expander("Preparar e-mail"):
         st.caption(
             "Este modo cria o rascunho. Para enviar automaticamente saindo do e-mail da vendedora, "
@@ -2600,7 +2620,7 @@ def renderizar_email_resumo(cliente, vendedor, oferta, chave):
             "E-mail do cliente",
             key=f"email_destino_resumo_{chave}"
         )
-        assunto_padrao, corpo_padrao = texto_email_resumo(cliente, vendedor, oferta)
+        assunto_padrao, corpo_padrao = texto_email_resumo(cliente, vendedor, oferta, row)
         assunto = st.text_input(
             "Assunto",
             value=assunto_padrao,
@@ -2631,9 +2651,30 @@ def renderizar_card_resumo(row, indice, modo="prioridade"):
     cliente_id = str(row.get("_cliente_id", row.get("Cliente ID", "")))
     valor = row.get("Valor", row.get("Ticket médio", 0))
     oferta = str(row.get("Oferta", row.get("Motivo", "")))
+    categoria = str(row.get("Categoria", "Recompra")).strip()
+    score = row.get("Score", "")
+    orcamento = str(row.get("Orçamento", "") or "").strip()
+    acao = str(row.get("Ação", "") or "").strip()
+    produto = str(row.get("Produto", "") or "").strip()
+    dias = row.get("Dias sem comprar", row.get("Idade", ""))
+    intervalo = row.get("Intervalo", "")
     chave = chave_widget(
         f"resumo_{modo}_{row.get('_budget_id', '')}_{cliente_id}_{cliente}_{indice}"
     )
+    detalhes = []
+    if produto:
+        detalhes.append(f"Produto sugerido: <b>{html_seguro(produto)}</b>")
+    if orcamento:
+        detalhes.append(f"Orçamento: <b>{html_seguro(orcamento)}</b>")
+    if dias != "":
+        detalhes.append(f"Dias em atenção: <b>{html_seguro(dias)}</b>")
+    if intervalo != "":
+        detalhes.append(f"Ciclo médio: <b>{html_seguro(intervalo)} dias</b>")
+    if score != "":
+        detalhes.append(f"Score: <b>{html_seguro(score)}</b>")
+    if acao:
+        detalhes.append(f"Ação sugerida: <b>{html_seguro(acao)}</b>")
+    detalhes_html = "<br>".join(detalhes)
 
     st.markdown(
         f"""
@@ -2641,13 +2682,17 @@ def renderizar_card_resumo(row, indice, modo="prioridade"):
 <b>{html_seguro(cliente)}</b><br>
 Vendedor: <b>{html_seguro(vendedor)}</b><br>
 Valor/ticket: <b>{fmt_html(valor)}</b><br>
-{html_seguro(oferta)}
+Tipo de prioridade: <b>{html_seguro(categoria)}</b><br>
+<br>
+<b>Por que está na fila?</b><br>
+{html_seguro(oferta)}<br>
+{detalhes_html}
 </div>
 """,
         unsafe_allow_html=True,
     )
     renderizar_botao_liguei_resumo(cliente_id, cliente, vendedor, oferta, chave)
-    renderizar_email_resumo(cliente, vendedor, oferta, chave)
+    renderizar_email_resumo(cliente, vendedor, oferta, chave, row)
     renderizar_agendamento_resumo(cliente_id, cliente, vendedor, chave)
 
 def renderizar_grid_resumo(df, modo):
@@ -2798,34 +2843,14 @@ def renderizar_resumo_diario(dados):
     if "resumo_diario_secao" not in st.session_state:
         st.session_state.resumo_diario_secao = "Início"
 
-    menu_resumo, conteudo_resumo = st.columns([1, 4])
-    with menu_resumo:
-        if st.button("Início", use_container_width=True):
-            st.session_state.resumo_diario_secao = "Início"
-            st.rerun()
-        if st.button("Fila de prioridades", use_container_width=True):
-            st.session_state.resumo_diario_secao = "Fila de prioridades"
-            st.rerun()
-        if st.button("Buscar clientes", use_container_width=True):
-            st.session_state.resumo_diario_secao = "Buscar cliente/produtos"
-            st.rerun()
-        if st.button("Ações rápidas", use_container_width=True):
-            st.session_state.resumo_diario_secao = "Ações rápidas"
-            st.rerun()
-        if st.button("Visão de gestão", use_container_width=True):
-            st.session_state.resumo_diario_secao = "Visão de gestão"
-            st.rerun()
-
     secao = st.session_state.resumo_diario_secao
 
-    with conteudo_resumo:
-
-        if secao == "Início":
-            st.markdown("#### Ofertas de recompra para hoje")
-            st.caption(
-                "Essas ofertas vêm do ciclo real de compra do cliente e aparecem já na entrada do Resumo Diário."
-            )
-            renderizar_grid_resumo(ofertas, "inicio_oferta")
+    if secao == "Início":
+        st.markdown("#### Ofertas de recompra para hoje")
+        st.caption(
+            "Essas ofertas vêm do ciclo real de compra do cliente e aparecem já na entrada do Resumo Diário."
+        )
+        renderizar_grid_resumo(ofertas, "inicio_oferta")
 
     if secao == "Fila de prioridades":
         st.markdown("#### Fila de prioridades")
@@ -4460,6 +4485,8 @@ if "pagina_atual_crm" not in st.session_state:
     st.session_state.pagina_atual_crm = "👑 CEO"
 if "abrir_resumo_diario" not in st.session_state:
     st.session_state.abrir_resumo_diario = False
+if "resumo_diario_secao" not in st.session_state:
+    st.session_state.resumo_diario_secao = "Início"
 opcoes_paginas_crm = opcoes_menu_crm + ["Resumo Diário"]
 if st.session_state.pagina_atual_crm not in opcoes_paginas_crm:
     st.session_state.pagina_atual_crm = "👑 CEO"
@@ -4487,14 +4514,35 @@ with st.sidebar.expander("📊 CRM Inteligente", expanded=True):
         st.session_state.pagina_atual_crm = pagina_selecionada
 
 with st.sidebar.expander("Resumo Diário", expanded=False):
-    st.caption("Gestão diária dos orçamentos das vendedoras dentro do CRM.")
+    secoes_resumo = [
+        "Início",
+        "Fila de prioridades",
+        "Buscar cliente/produtos",
+        "Ações rápidas",
+        "Visão de gestão",
+    ]
+    secao_resumo_lateral = st.radio(
+        "Seções",
+        secoes_resumo,
+        index=secoes_resumo.index(st.session_state.resumo_diario_secao)
+        if st.session_state.resumo_diario_secao in secoes_resumo else 0,
+        key="menu_lateral_resumo_diario",
+        label_visibility="collapsed",
+    )
+    secao_anterior_resumo = st.session_state.get("menu_lateral_resumo_anterior")
+    if secao_anterior_resumo is None:
+        st.session_state.menu_lateral_resumo_anterior = secao_resumo_lateral
+    elif secao_resumo_lateral != secao_anterior_resumo:
+        st.session_state.resumo_diario_secao = secao_resumo_lateral
+        st.session_state.abrir_resumo_diario = True
+        st.session_state.pagina_atual_crm = "Resumo Diário"
+        st.session_state.menu_lateral_resumo_anterior = secao_resumo_lateral
+        st.rerun()
     if st.button("Abrir Resumo Diário", use_container_width=True):
+        st.session_state.resumo_diario_secao = secao_resumo_lateral
         st.session_state.abrir_resumo_diario = True
         st.session_state.pagina_atual_crm = "Resumo Diário"
         st.rerun()
-    st.caption(
-        "Escolha manualmente a vendedora na tela. A visão de gestão mostra todas."
-    )
 
 pagina = st.session_state.pagina_atual_crm
 
