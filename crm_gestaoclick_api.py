@@ -11,7 +11,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -2201,6 +2200,332 @@ def renderizar_lista_itens(titulo, itens):
     if len(itens) > 30:
         st.caption(f"Mostrando 30 de {len(itens)} itens encontrados.")
 
+def status_aberto_resumo_diario(status):
+    bloqueados = (
+        "APROVADO|CANCELADO|CONFIRMADO|CONCRETIZADO|CONVERTIDO|"
+        "FINALIZADO|FATURADO|PERDIDO|RECUSADO|VENDIDO|FECHADO"
+    )
+    return not bool(re.search(bloqueados, str(status or "").upper()))
+
+def data_retorno_cliente(cliente_id, cliente):
+    retornos = retornos_pendentes_cliente(cliente_id, cliente)
+    datas = []
+    for retorno in retornos:
+        data_retorno = pd.to_datetime(
+            retorno.get("data_retorno"), dayfirst=True, errors="coerce"
+        )
+        if pd.notna(data_retorno):
+            datas.append(data_retorno)
+    return min(datas) if datas else pd.NaT
+
+def montar_resumo_diario_oportunidades(dados, vendedor="Todas"):
+    orcamentos = dados.get("orcamentos_todos", pd.DataFrame()).copy()
+    vendas = dados.get("vendas_validas", pd.DataFrame()).copy()
+    if orcamentos.empty:
+        return pd.DataFrame(), {
+            "calls": 0, "hot": 0, "returns": 0, "untouched": 0, "expiring": 0
+        }
+
+    co_num = dados.get("co_num") or achar_coluna(orcamentos, ["nº", "n°", "numero", "número"])
+    co_cli = dados.get("co_cli") or achar_coluna(orcamentos, ["cliente"])
+    co_data = dados.get("co_data") or achar_coluna(orcamentos, ["data"])
+    co_valor = dados.get("co_valor") or achar_coluna(orcamentos, ["valor"])
+    co_status = achar_coluna(orcamentos, ["situação", "situacao", "status"])
+    co_vendedor = achar_coluna(orcamentos, ["vendedor"])
+    co_cli_id = achar_coluna(orcamentos, ["cliente id"])
+    co_validade = achar_coluna(orcamentos, ["validade"])
+
+    if not all([co_num, co_cli, co_data, co_status]):
+        return pd.DataFrame(), {
+            "calls": 0, "hot": 0, "returns": 0, "untouched": 0, "expiring": 0
+        }
+
+    hoje = pd.Timestamp(date.today())
+    orcamentos[co_data] = pd.to_datetime(orcamentos[co_data], errors="coerce")
+    orcamentos = orcamentos.dropna(subset=[co_data]).copy()
+    orcamentos = orcamentos[orcamentos[co_status].apply(status_aberto_resumo_diario)].copy()
+    orcamentos = orcamentos[
+        orcamentos[co_data] >= hoje - pd.Timedelta(days=30)
+    ].copy()
+
+    if co_vendedor:
+        orcamentos["_vendedor_resumo"] = (
+            orcamentos[co_vendedor].fillna("Sem vendedor").astype(str).str.strip()
+        )
+    else:
+        orcamentos["_vendedor_resumo"] = "Sem vendedor"
+    orcamentos.loc[orcamentos["_vendedor_resumo"].isin(["", "nan", "None"]), "_vendedor_resumo"] = "Sem vendedor"
+    if vendedor and vendedor != "Todas":
+        orcamentos = orcamentos[orcamentos["_vendedor_resumo"] == vendedor].copy()
+
+    if orcamentos.empty:
+        return pd.DataFrame(), {
+            "calls": 0, "hot": 0, "returns": 0, "untouched": 0, "expiring": 0
+        }
+
+    if co_cli_id:
+        orcamentos["_cliente_chave_resumo"] = orcamentos[co_cli_id].astype(str).str.strip()
+        orcamentos.loc[
+            orcamentos["_cliente_chave_resumo"].str.lower().isin(["", "nan", "none"]),
+            "_cliente_chave_resumo"
+        ] = orcamentos.loc[
+            orcamentos["_cliente_chave_resumo"].str.lower().isin(["", "nan", "none"]), co_cli
+        ].map(norm)
+    else:
+        orcamentos["_cliente_chave_resumo"] = orcamentos[co_cli].map(norm)
+
+    venda_counts = pd.Series(dtype=int)
+    if not vendas.empty:
+        chave_venda = "_cliente_chave" if "_cliente_chave" in vendas.columns else achar_coluna(vendas, ["cliente id", "cliente"])
+        if chave_venda:
+            venda_counts = vendas.groupby(chave_venda).size()
+    budget_counts = orcamentos.groupby("_cliente_chave_resumo").size()
+
+    linhas = []
+    counters = {"calls": 0, "hot": 0, "returns": 0, "untouched": 0, "expiring": 0}
+    for _, row in orcamentos.iterrows():
+        cliente = str(row.get(co_cli, "Cliente sem nome")).strip()
+        cliente_id = str(row.get(co_cli_id, "")).strip() if co_cli_id else ""
+        chave = row["_cliente_chave_resumo"]
+        data_orc = pd.to_datetime(row[co_data], errors="coerce")
+        idade = int((hoje - data_orc.normalize()).days) if pd.notna(data_orc) else 0
+        total = float(row.get(co_valor, 0) or 0) if co_valor else 0.0
+        ja_ligou = contato_realizado_hoje(cliente_id, cliente)
+        retorno_data = data_retorno_cliente(cliente_id, cliente)
+        tem_retorno = pd.notna(retorno_data) and retorno_data.normalize() <= hoje
+        compra_count = int(venda_counts.get(chave, 0)) if not venda_counts.empty else 0
+        budget_count = int(budget_counts.get(chave, 0))
+        score = 20
+        score += min(int(total / 1000) * 2, 30)
+        score += min(compra_count * 12, 24)
+        score += min(budget_count * 3, 12)
+        score += 12 if ja_ligou else 0
+        score -= min(max(idade - 7, 0), 20)
+        score = max(0, min(score, 100))
+
+        categorias = []
+        if tem_retorno:
+            categorias.append((110, "RETORNO", "Retorno agendado para hoje ou atrasado", "Retornar"))
+            counters["returns"] += 1
+        elif not ja_ligou and idade == 2:
+            categorias.append((100, "RETORNO", "Orçamento com 2 dias: ligar hoje", "Ligar"))
+            counters["returns"] += 1
+        if not ja_ligou and idade == 3:
+            categorias.append((105, "SEM CONTATO", "Urgente: orçamento com 3 dias", "Ligar urgente"))
+            counters["untouched"] += 1
+        elif not ja_ligou and idade >= 4:
+            categorias.append((108, "SEM CONTATO", f"Risco de perda: orçamento com {idade} dias", "Priorizar"))
+            counters["untouched"] += 1
+
+        sinais = []
+        if total >= 5000:
+            sinais.append("alto valor")
+        if compra_count > 0:
+            sinais.append("já comprou")
+        if budget_count > 1:
+            sinais.append("cliente recorrente")
+        if ja_ligou:
+            sinais.append("contato hoje")
+        if score >= 65 and len(sinais) >= 2 and idade <= 14:
+            categorias.append((90, "QUENTE", "Oportunidade: " + ", ".join(sinais[:3]), "Priorizar"))
+            counters["hot"] += 1
+
+        validade_txt = str(row.get(co_validade, "")).strip() if co_validade else ""
+        validade = pd.to_datetime(validade_txt, dayfirst=True, errors="coerce")
+        if pd.notna(validade) and 0 <= (validade.normalize() - hoje).days <= 3:
+            dias = int((validade.normalize() - hoje).days)
+            categorias.append((85, "VENCENDO", f"Validade termina em {dias} dias", "Renovar"))
+            counters["expiring"] += 1
+        if not ja_ligou and idade == 1:
+            categorias.append((60, "NOVO", "Orçamento com 1 dia: acompanhamento normal", "Acompanhar"))
+
+        if not categorias:
+            continue
+        prioridade, categoria, motivo, acao = max(categorias, key=lambda valor: valor[0])
+        if categoria in ("RETORNO", "SEM CONTATO", "VENCENDO"):
+            counters["calls"] += 1
+        linhas.append({
+            "Categoria": categoria,
+            "Score": score,
+            "Cliente": cliente,
+            "Vendedor": row["_vendedor_resumo"],
+            "Orçamento": str(row.get(co_num, "")),
+            "Valor": total,
+            "Idade": idade,
+            "Último contato": "Hoje" if ja_ligou else f"{idade} dias sem contato",
+            "Motivo": motivo,
+            "Ação": acao,
+            "_prioridade": prioridade,
+            "_budget_id": str(row.get("_orcamento_id", "") or row.get(co_num, "")),
+            "_cliente_id": cliente_id,
+        })
+    oportunidades = pd.DataFrame(linhas)
+    if not oportunidades.empty:
+        oportunidades = oportunidades.sort_values(
+            ["_prioridade", "Score", "Valor", "Cliente"],
+            ascending=[False, False, False, True]
+        )
+    return oportunidades, counters
+
+def renderizar_resumo_diario(dados):
+    st.subheader("Resumo Diário")
+    st.caption("Gestão diária dos orçamentos e prioridades das vendedoras.")
+    orcamentos = dados.get("orcamentos_todos", pd.DataFrame())
+    if orcamentos.empty:
+        st.info("Carregue os dados da API para montar o resumo diário.")
+        return
+    vendedor_col = achar_coluna(orcamentos, ["vendedor"])
+    vendedores = ["Todas"]
+    if vendedor_col:
+        vendedores += sorted(
+            nome for nome in orcamentos[vendedor_col].dropna().astype(str).str.strip().unique()
+            if nome and nome.lower() not in {"nan", "none"}
+        )
+    col_filtro, col_visao = st.columns(2)
+    vendedor = col_filtro.selectbox("Vendedor", vendedores, key="resumo_diario_vendedor")
+    visao = col_visao.radio(
+        "Visão",
+        ["Visão do vendedor", "Visão de gestão"],
+        horizontal=True,
+        key="resumo_diario_visao"
+    )
+    oportunidades, counters = montar_resumo_diario_oportunidades(dados, vendedor)
+    cols = st.columns(5)
+    cols[0].metric("Ligações hoje", counters["calls"])
+    cols[1].metric("Oportunidades quentes", counters["hot"])
+    cols[2].metric("Retornos hoje", counters["returns"])
+    cols[3].metric("Sem contato", counters["untouched"])
+    cols[4].metric("Vencendo", counters["expiring"])
+
+    if oportunidades.empty:
+        st.success("Nenhuma prioridade encontrada para os filtros selecionados.")
+        return
+
+    filtro = st.radio(
+        "Mostrar",
+        ["Todas", "Oportunidades quentes", "Retornos hoje"],
+        horizontal=True,
+        key="resumo_diario_filtro"
+    )
+    exibicao = oportunidades.copy()
+    if filtro == "Oportunidades quentes":
+        exibicao = exibicao[exibicao["Categoria"] == "QUENTE"]
+    elif filtro == "Retornos hoje":
+        exibicao = exibicao[exibicao["Categoria"] == "RETORNO"]
+
+    if visao == "Visão de gestão":
+        st.markdown("#### Desempenho por vendedor")
+        gestao = oportunidades.groupby("Vendedor").agg(
+            Prioridades=("Cliente", "count"),
+            Ligacoes=("Categoria", lambda s: int(s.isin(["RETORNO", "SEM CONTATO", "VENCENDO"]).sum())),
+            Quentes=("Categoria", lambda s: int((s == "QUENTE").sum())),
+            Retornos=("Categoria", lambda s: int((s == "RETORNO").sum())),
+            Valor=("Valor", "sum"),
+        ).reset_index()
+        gestao["Valor"] = gestao["Valor"].map(fmt)
+        st.dataframe(gestao, use_container_width=True, hide_index=True)
+
+    tabela = exibicao[[
+        "Categoria", "Score", "Cliente", "Vendedor", "Orçamento",
+        "Valor", "Último contato", "Motivo", "Ação"
+    ]].copy()
+    tabela["Valor"] = tabela["Valor"].map(fmt)
+    st.markdown("#### Fila de prioridades")
+    st.dataframe(tabela, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Ações rápidas")
+    st.caption("Use os cartões abaixo para registrar contato ou programar retorno sem sair do Resumo Diário.")
+    for indice, row in exibicao.head(30).iterrows():
+        cliente = str(row.get("Cliente", "Cliente sem nome"))
+        vendedor_card = str(row.get("Vendedor", "Sem vendedor"))
+        cliente_id = str(row.get("_cliente_id", ""))
+        chave = chave_widget(
+            f"resumo_diario_{row.get('_budget_id', '')}_{cliente}_{indice}"
+        )
+        with st.expander(
+            f"{row.get('Categoria', 'PRIORIDADE')} | {cliente} | {fmt(row.get('Valor', 0))}"
+        ):
+            st.write(f"**Vendedor:** {vendedor_card}")
+            st.write(f"**Orçamento:** {row.get('Orçamento', '')}")
+            st.write(f"**Motivo:** {row.get('Motivo', '')}")
+            st.write(f"**Ação sugerida:** {row.get('Ação', '')}")
+
+            historico_contatos = [
+                c for c in st.session_state.contatos_realizados
+                if cliente_corresponde(c, cliente_id, cliente)
+            ][-3:]
+            historico_retornos = [
+                r for r in st.session_state.retornos_programados
+                if cliente_corresponde(r, cliente_id, cliente)
+            ][-3:]
+            if historico_contatos or historico_retornos:
+                with st.expander("Ver histórico curto"):
+                    for contato in historico_contatos:
+                        st.write(
+                            f"{contato.get('data', '')} {contato.get('hora', '')} - "
+                            f"{contato.get('status', '')} - {contato.get('observacao', '')}"
+                        )
+                    for retorno in historico_retornos:
+                        st.write(
+                            f"Retorno {retorno.get('data_retorno', '')} - "
+                            f"{retorno.get('motivo', '')} - {retorno.get('status', '')}"
+                        )
+
+            observacao = st.text_input(
+                "Observação do contato",
+                key=f"resumo_diario_obs_{chave}"
+            )
+            col_ligar, col_retorno = st.columns(2)
+            if col_ligar.button(
+                "Já Liguei",
+                key=f"resumo_diario_liguei_{chave}",
+                type="primary",
+                use_container_width=True,
+            ):
+                try:
+                    salvar_contato_realizado(
+                        cliente_id, cliente, vendedor_card, observacao, "resumo_diario"
+                    )
+                    st.success("Contato registrado. Esse cliente sai das prioridades de hoje.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Não foi possível registrar o contato: {e}")
+
+            with col_retorno:
+                data_retorno = st.date_input(
+                    "Data do retorno",
+                    value=date.today() + timedelta(days=1),
+                    min_value=date.today(),
+                    key=f"resumo_diario_data_retorno_{chave}"
+                )
+                motivo = st.text_input(
+                    "Motivo",
+                    value="Retorno comercial",
+                    key=f"resumo_diario_motivo_{chave}"
+                )
+                observacao_retorno = st.text_area(
+                    "Observação do retorno",
+                    key=f"resumo_diario_obs_retorno_{chave}"
+                )
+                if st.button(
+                    "Agendar Retorno",
+                    key=f"resumo_diario_agendar_{chave}",
+                    use_container_width=True,
+                ):
+                    try:
+                        agendar_retorno_cliente(
+                            cliente_id,
+                            cliente,
+                            vendedor_card,
+                            data_retorno,
+                            motivo,
+                            observacao_retorno,
+                        )
+                        st.success(f"Retorno agendado para {data_retorno:%d/%m/%Y}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Não foi possível agendar o retorno: {e}")
+
 def card_cliente(row, tipo, posicao):
     atraso = int(row["dias_sem_comprar"] - row["intervalo"])
     estrela = "⭐ Cliente estratégico<br>" if row["cliente_estrategico"] else ""
@@ -3196,6 +3521,9 @@ def renderizar():
     else:
         st.info("Dados carregados por arquivos Excel.")
 
+    if pagina == "Resumo Diário":
+        renderizar_resumo_diario(dados)
+
     if pagina == "👑 CEO":
         st.subheader("👑 Painel CEO")
 
@@ -3598,40 +3926,42 @@ opcoes_menu_crm = [
 ]
 if "pagina_atual_crm" not in st.session_state:
     st.session_state.pagina_atual_crm = "👑 CEO"
-if st.session_state.pagina_atual_crm not in opcoes_menu_crm:
+if "abrir_resumo_diario" not in st.session_state:
+    st.session_state.abrir_resumo_diario = False
+opcoes_paginas_crm = opcoes_menu_crm + ["Resumo Diário"]
+if st.session_state.pagina_atual_crm not in opcoes_paginas_crm:
     st.session_state.pagina_atual_crm = "👑 CEO"
 
 with st.sidebar.expander("📊 CRM Inteligente", expanded=True):
+    pagina_radio_atual = st.session_state.get("menu_lateral_crm", "👑 CEO")
+    if pagina_radio_atual not in opcoes_menu_crm:
+        pagina_radio_atual = "👑 CEO"
     pagina_selecionada = st.radio(
         "Abas",
         opcoes_menu_crm,
-        index=opcoes_menu_crm.index(st.session_state.pagina_atual_crm),
+        index=opcoes_menu_crm.index(pagina_radio_atual),
         key="menu_lateral_crm",
         label_visibility="collapsed",
     )
-    st.session_state.pagina_atual_crm = pagina_selecionada
+
+    radio_anterior = st.session_state.get("menu_lateral_crm_anterior")
+    if radio_anterior is None:
+        st.session_state.menu_lateral_crm_anterior = pagina_selecionada
+    elif pagina_selecionada != radio_anterior:
+        st.session_state.abrir_resumo_diario = False
+        st.session_state.pagina_atual_crm = pagina_selecionada
+        st.session_state.menu_lateral_crm_anterior = pagina_selecionada
+    elif not st.session_state.abrir_resumo_diario:
+        st.session_state.pagina_atual_crm = pagina_selecionada
 
 with st.sidebar.expander("Resumo Diário", expanded=False):
-    st.caption("Software Gestão de Orçamentos das Vendedoras.")
-    resumo_zip = Path(__file__).with_name("Resumo-Diario-Alice.zip")
-    if resumo_zip.exists():
-        st.markdown(
-            link_download_bytes(
-                "Baixar Resumo Diário Alice",
-                resumo_zip.read_bytes(),
-                "Resumo-Diario-Alice.zip",
-                "application/zip",
-            ),
-            unsafe_allow_html=True,
-        )
-    else:
-        st.warning(
-            "Arquivo Resumo-Diario-Alice.zip não encontrado junto ao app. "
-            "Suba esse ZIP no mesmo repositório do streamlit_app.py."
-        )
+    st.caption("Gestão diária dos orçamentos das vendedoras dentro do CRM.")
+    if st.button("Abrir Resumo Diário", use_container_width=True):
+        st.session_state.abrir_resumo_diario = True
+        st.session_state.pagina_atual_crm = "Resumo Diário"
+        st.rerun()
     st.caption(
-        "Esse é o mesmo pacote do caminho: "
-        "ainda-usando-o-gestao-click-quero/outputs/Resumo-Diario-Alice.zip"
+        "Escolha manualmente a vendedora na tela. A visão de gestão mostra todas."
     )
 
 pagina = st.session_state.pagina_atual_crm
